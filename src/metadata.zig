@@ -66,10 +66,10 @@ pub fn encodeTimeout(ns: u64, buf: *[9]u8) []const u8 {
         const v = std.math.divCeil(u64, ns, u.div) catch unreachable;
         if (v <= max) return std.fmt.bufPrint(buf, "{d}{c}", .{ v, u.unit }) catch unreachable;
     }
-    // Over 99999999 milliseconds (~11 days): use hours with clamping.
+    // Over 99999999 milliseconds (~27.8h): fall back to hours. The largest u64
+    // ns is ~5.1M hours (7 digits), so it always fits the 8-digit budget.
     const v_h = std.math.divCeil(u64, ns, std.time.ns_per_hour) catch unreachable;
-    const clamped = @min(v_h, max);
-    return std.fmt.bufPrint(buf, "{d}H", .{clamped}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d}H", .{v_h}) catch unreachable;
 }
 
 const testing = std.testing;
