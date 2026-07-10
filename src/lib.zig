@@ -18,12 +18,20 @@ pub const Method = codec_mod.Method;
 const server_mod = @import("server.zig");
 pub const server = server_mod;
 
+const call_mod = @import("call.zig");
+const channel_mod = @import("channel.zig");
+pub const CallOptions = call_mod.CallOptions;
+pub const RawCall = call_mod.RawCall;
+pub const Channel = channel_mod.Channel;
+
 test {
     _ = status_mod;
     _ = metadata_mod;
     _ = frame;
     _ = codec_mod;
     _ = server_mod;
+    _ = call_mod;
+    _ = channel_mod;
 }
 
 test "scaffold compiles" {
