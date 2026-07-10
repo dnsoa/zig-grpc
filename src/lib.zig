@@ -15,11 +15,15 @@ pub const frame = @import("frame.zig");
 const codec_mod = @import("codec.zig");
 pub const Method = codec_mod.Method;
 
+const server_mod = @import("server.zig");
+pub const server = server_mod;
+
 test {
     _ = status_mod;
     _ = metadata_mod;
     _ = frame;
     _ = codec_mod;
+    _ = server_mod;
 }
 
 test "scaffold compiles" {
