@@ -139,5 +139,3 @@ On success it prints `PASS:` lines for each scenario, then `INTEROP OK`.
 - `src/call.zig` — `RawCall` (byte-level gRPC state machine) + typed `Call(M)`
 - `src/server.zig` — server-side shapes (`ServerCall`, `HandlerFn`, `Registry`)
 - `src/interop.zig` — the grpc-go interop client
-
-Design spec: [docs/superpowers/specs/2026-07-10-zig-grpc-api-design.md](docs/superpowers/specs/2026-07-10-zig-grpc-api-design.md).
