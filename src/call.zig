@@ -17,7 +17,8 @@ pub const Metadata = metadata_mod.Metadata;
 pub const CallOptions = struct {
     metadata: []const Metadata.Entry = &.{},
     /// Encoded as `grpc-timeout`; enforced by the SERVER. v1 has no local
-    /// deadline (a blocked recv cannot be interrupted — see the spec).
+    /// deadline timer — to abort a blocked recv early, call `cancel()` from
+    /// another thread.
     timeout_ns: ?u64 = null,
     /// For `Channel.unary` only: receives the final Status on non-OK.
     status_out: ?*Status = null,
@@ -64,13 +65,15 @@ pub const RawCall = struct {
         try self.stream.send("", true);
     }
 
-    /// Tells the server to cancel (RST_STREAM CANCEL) and releases the
-    /// stream's concurrency slot. Does NOT interrupt a concurrently blocked
-    /// recv on another thread — see the spec's threading section.
+    /// Tells the server to cancel (RST_STREAM CANCEL). Safe to call from a
+    /// thread other than the receiver: the underlying stream wakes a blocked
+    /// `recvMessage`/`header`, which returns promptly with a `cancelled` status.
+    ///
+    /// Deliberately touches no `RawCall` state — `stat`/`state` are owned by the
+    /// receiver thread and are materialized there when `step()` observes the
+    /// resulting `error.StreamCancelled`, so cancel never races the receiver.
     pub fn cancel(self: *RawCall) void {
         self.stream.cancel() catch {};
-        if (self.stat == null) self.stat = .{ .code = .cancelled, .message = "cancelled by client" };
-        self.state = .done;
     }
 
     /// Releases the call. Must not race a concurrent sendMessage/recvMessage.
@@ -592,6 +595,46 @@ test "compressed-flag message errors and surfaces internal status" {
     defer arena_state.deinit();
     try testing.expectError(error.CompressedUnsupported, call.recvMessage(arena_state.allocator()));
     try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+}
+
+const CancelReceiver = struct {
+    call: *RawCall,
+    got_null: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *CancelReceiver) void {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        // A cancel wakes readEvent → StreamCancelled → step() ends the call, so
+        // recvMessage returns null (not a Zig error). `catch null` is just belt.
+        const m = self.call.recvMessage(arena_state.allocator()) catch null;
+        self.got_null = (m == null);
+        self.done.store(true, .release);
+    }
+};
+
+test "cancel() from another thread unblocks recvMessage with cancelled status" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    // Drain the client's HEADERS; the peer then stays silent so the receiver
+    // thread blocks in readEvent until the cancel wakes it.
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+
+    var recv: CancelReceiver = .{ .call = &call };
+    const th = try std.Thread.spawn(.{}, CancelReceiver.run, .{&recv});
+    // Give the receiver a moment to block, so we exercise the wake path.
+    std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    call.cancel();
+    th.join();
+
+    try testing.expect(recv.got_null);
+    try testing.expectEqual(status_mod.Code.cancelled, (try call.finish()).code);
 }
 
 // ---- Task 9: typed Call(M) / start / unary tests ----
