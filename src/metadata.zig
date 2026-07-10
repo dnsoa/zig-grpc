@@ -69,8 +69,7 @@ pub fn encodeTimeout(ns: u64, buf: *[9]u8) []const u8 {
     // Over 99999999 milliseconds (~11 days): use hours with clamping.
     const v_h = std.math.divCeil(u64, ns, std.time.ns_per_hour) catch unreachable;
     const clamped = @min(v_h, max);
-    _ = std.fmt.bufPrint(buf, "{d}H", .{clamped}) catch unreachable;
-    return buf;
+    return std.fmt.bufPrint(buf, "{d}H", .{clamped}) catch unreachable;
 }
 
 const testing = std.testing;
@@ -115,4 +114,13 @@ test "encodeTimeout picks the smallest unit that fits, rounding up" {
     // 向上取整:1500ns 不能编成 1u(会缩短 deadline)
     try testing.expectEqualStrings("2u", encodeTimeout(1_500, &buf));
     try testing.expectEqualStrings("100000m", encodeTimeout(100_000_000_000, &buf));
+}
+
+test "encodeTimeout falls back to hours without trailing garbage" {
+    var buf: [9]u8 = undefined;
+    // > 99_999_999 ms (~27.8h) forces the hours branch; the returned slice
+    // must be exactly the printed value, not the whole backing buffer.
+    try testing.expectEqualStrings("48H", encodeTimeout(48 * std.time.ns_per_hour, &buf));
+    // Largest u64 ns is ~5.1M hours (8 digits) — still a clean slice, no tail.
+    try testing.expectEqualStrings("5124096H", encodeTimeout(std.math.maxInt(u64), &buf));
 }
