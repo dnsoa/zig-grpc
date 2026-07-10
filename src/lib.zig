@@ -10,9 +10,12 @@ pub const Status = status_mod.Status;
 const metadata_mod = @import("metadata.zig");
 pub const Metadata = metadata_mod.Metadata;
 
+pub const frame = @import("frame.zig");
+
 test {
     _ = status_mod;
     _ = metadata_mod;
+    _ = frame;
 }
 
 test "scaffold compiles" {
