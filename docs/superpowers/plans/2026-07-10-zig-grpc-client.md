@@ -17,7 +17,7 @@
 - 依赖:仅 `zig_http2`(`.path = "../zig-http2"`);zig-grpc 自身 dependency-free
 - 模块名 `zig_grpc`;消费者 `@import("zig_grpc")`
 - v1 明确不做:压缩(仅 identity)、client 本地 deadline、连接池/重连/负载均衡、TLS(调用方自行包装)
-- **zig-http2 缺口约定**:实现中发现 zig-http2 能力不足,停下来显式上报,在 zig-http2 侧修复(带测试)后继续;不得在 zig-grpc 里绕过。已知缺口:无法本地打断阻塞中的 `readEvent`(spec 已记录,v1 接受)
+- **zig-http2 缺口约定**:实现中发现 zig-http2 能力不足,停下来显式上报,在 zig-http2 侧修复(带测试)后继续;不得在 zig-grpc 里绕过。已知缺口「无法本地打断阻塞中的 `readEvent`」**已在 zig-http2 修复**:`Stream.cancel()` 现在会唤醒阻塞的 `readEvent`(返回 `error.StreamCancelled`)与阻塞的 `send`(返回 `error.StreamReset`)。因此 Task 7 的 `step()` readEvent 错误处理需增加一条 `error.StreamCancelled => { if (self.stat == null) self.stat = .{ .code = .cancelled, .message = "cancelled" }; self.state = .done; }` 分支(放在 `error.ConnectionClosed` 之后、`else` 之前)
 - 每个任务结束运行 `zig build test`(全绿)再 commit
 - gRPC wire 规范:HEADERS 映射、5 字节消息帧、`grpc-status`/`grpc-message`(percent 编码)、`grpc-timeout`、`-bin` metadata(base64 无 padding)
 - zig-http2 API 核对基线:commit `48b7501`。计划中引用的 h2 API:`h2.Client.init(io,gpa,r,w)` / `openStream(RequestHead,end_stream)!*Stream` / `Stream.send(data,end_stream)` / `Stream.readEvent(arena)!Event` / `Stream.cancel()` / `Stream.close()` / `h2.Server{.io,.gpa,.handler,.userdata}` + `h2.serveConn(srv,r,w,client_ip,scheme)`(返回 void)/ `h2.Context`(`.req.get(name)`、`.body_reader.?.read(buf)`、`.res.status/header/write/trailer/finish`、`.arena`、`.userdata`)/ `h2.proto`(`preface`、`FrameType`、`flag_*`、`putHeader`、`parseHeader`、`ErrorCode`)
