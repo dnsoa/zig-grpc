@@ -27,4 +27,15 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("zig_http2", h2_mod);
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));
     test_step.dependOn(&run_tests.step);
+
+    // ---- `zig build interop` ----
+    const interop_mod = b.createModule(.{
+        .root_source_file = b.path("src/interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interop_mod.addImport("zig_grpc", mod);
+    const interop_exe = b.addExecutable(.{ .name = "zig-grpc-interop", .root_module = interop_mod });
+    const interop_step = b.step("interop", "Build the Go-interop client (see scripts/interop.sh)");
+    interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
 }
