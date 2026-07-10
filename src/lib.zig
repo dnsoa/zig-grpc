@@ -12,10 +12,14 @@ pub const Metadata = metadata_mod.Metadata;
 
 pub const frame = @import("frame.zig");
 
+const codec_mod = @import("codec.zig");
+pub const Method = codec_mod.Method;
+
 test {
     _ = status_mod;
     _ = metadata_mod;
     _ = frame;
+    _ = codec_mod;
 }
 
 test "scaffold compiles" {
