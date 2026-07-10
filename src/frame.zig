@@ -48,11 +48,24 @@ pub const Assembler = struct {
         if (avail.len < prefix_len + len) return null;
         const msg = try arena.dupe(u8, avail[prefix_len .. prefix_len + len]);
         self.head += prefix_len + len;
+        self.reclaim();
+        return msg;
+    }
+
+    /// Drops already-consumed bytes so a long-lived stream whose messages never
+    /// align to DATA-frame boundaries stays bounded. Full drain clears the
+    /// buffer; otherwise the tail is compacted to the front once the consumed
+    /// prefix reaches half the buffer, which keeps the copy work amortized O(1).
+    fn reclaim(self: *Assembler) void {
         if (self.head == self.buf.items.len) {
             self.buf.clearRetainingCapacity();
             self.head = 0;
+        } else if (self.head >= self.buf.items.len - self.head) {
+            const remaining = self.buf.items.len - self.head;
+            std.mem.copyForwards(u8, self.buf.items[0..remaining], self.buf.items[self.head..]);
+            self.buf.shrinkRetainingCapacity(remaining);
+            self.head = 0;
         }
-        return msg;
     }
 
     /// True when leftover bytes do not form a complete message — a protocol
@@ -127,6 +140,33 @@ test "compressed flag and garbage flag rejected" {
     defer b.deinit();
     try b.feed(&.{ 9, 0, 0, 0, 0 });
     try testing.expectError(error.MalformedFrame, b.next(arena_state.allocator()));
+}
+
+test "long stream with unaligned frames stays bounded (compaction)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var a = Assembler.init(testing.allocator, 1024);
+    defer a.deinit();
+
+    const payload = "0123456789"; // 10-byte payload -> 15-byte frame
+    const prefix = encodePrefix(payload.len);
+    const bound = prefix_len + payload.len + prefix_len; // one full frame + a pending prefix
+
+    // Prime with the first message's prefix, then on each iteration complete the
+    // pending message and start the next one's prefix so the buffer never fully
+    // drains — without compaction its length would grow by a frame every round.
+    try a.feed(&prefix);
+    var iter: usize = 0;
+    while (iter < 1000) : (iter += 1) {
+        try a.feed(payload);
+        try a.feed(&prefix);
+        const m = (try a.next(arena)).?;
+        try testing.expectEqualStrings(payload, m);
+        _ = arena_state.reset(.retain_capacity);
+        try testing.expect(a.buf.items.len <= bound);
+    }
+    try testing.expect(a.hasPartial());
 }
 
 test "hasPartial reports a truncated message" {
