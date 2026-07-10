@@ -406,3 +406,143 @@ test "non-OK status with percent-decoded message" {
     try testing.expectEqual(status_mod.Code.not_found, st.code);
     try testing.expectEqualStrings("no such thing", st.message);
 }
+
+// ---- Task 8: abnormal-path tests (raw-frame peer) ----
+
+test "RST_STREAM(CANCEL) maps to cancelled status" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+    try rp.writeRst(sid, .cancel);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Event order: .rst event → state=done → recvMessage returns null (stream ended).
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    const st = try call.finish();
+    try testing.expectEqual(status_mod.Code.cancelled, st.code);
+}
+
+test "true Trailers-Only: single HEADERS with END_STREAM carries the status" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try blk.literal(testing.allocator, "grpc-status", "12");
+    try blk.literal(testing.allocator, "grpc-message", "unimplemented");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, blk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    const st = try call.finish();
+    try testing.expectEqual(status_mod.Code.unimplemented, st.code);
+    try testing.expectEqualStrings("unimplemented", st.message);
+    // header() returns an empty Metadata under Trailers-Only.
+    try testing.expectEqual(@as(usize, 0), (try call.header()).entries.len);
+}
+
+test "trailers missing grpc-status map to internal" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Initial HEADERS (200 + grpc content-type, no END_STREAM).
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+    // trailers without grpc-status.
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "x-oops", "1");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+}
+
+test "non-grpc content-type maps to internal and cancels the stream" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "text/html");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+    // The client should emit RST_STREAM (abandon).
+    const rst = try rp.readUntil(.rst_stream);
+    testing.allocator.free(rst.payload);
+}
+
+test "compressed-flag message errors and surfaces internal status" {
+    var lb: testutil.Loopback = undefined;
+    const lbh = struct {
+        fn h(ctx: *h2.Context) anyerror!void {
+            var buf: [64]u8 = undefined;
+            _ = try readAllBody(ctx, &buf);
+            ctx.res.status(200);
+            try ctx.res.header("content-type", "application/grpc");
+            try ctx.res.write(&.{ 1, 0, 0, 0, 0 }); // compressed flag = 1
+            try ctx.res.trailer("grpc-status", "0");
+            try ctx.res.finish();
+        }
+    };
+    try lb.start(testing.io, testing.allocator, lbh.h, null, .{});
+    defer lb.stop();
+
+    var call = try lb.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.sendMessage("x");
+    try call.closeSend();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.CompressedUnsupported, call.recvMessage(arena_state.allocator()));
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+}
