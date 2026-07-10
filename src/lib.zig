@@ -7,8 +7,12 @@ const status_mod = @import("status.zig");
 pub const Code = status_mod.Code;
 pub const Status = status_mod.Status;
 
+const metadata_mod = @import("metadata.zig");
+pub const Metadata = metadata_mod.Metadata;
+
 test {
     _ = status_mod;
+    _ = metadata_mod;
 }
 
 test "scaffold compiles" {
