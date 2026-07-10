@@ -3,6 +3,14 @@
 
 const std = @import("std");
 
+const status_mod = @import("status.zig");
+pub const Code = status_mod.Code;
+pub const Status = status_mod.Status;
+
+test {
+    _ = status_mod;
+}
+
 test "scaffold compiles" {
     const h2 = @import("zig_http2");
     _ = h2;
