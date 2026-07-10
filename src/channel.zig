@@ -13,6 +13,8 @@ pub const Channel = struct {
     gpa: std.mem.Allocator,
     h2c: h2.Client,
     opts: Options,
+    owned: ?*OwnedConn = null,
+    authority_owned: bool = false,
 
     pub const Options = struct {
         authority: []const u8 = "",
@@ -29,8 +31,54 @@ pub const Channel = struct {
         try self.h2c.init(io, gpa, r, w);
     }
 
+    /// Heap-pinned transport state for connectTcp: the reader/writer hold
+    /// pointers into these buffers, so the block must never move.
+    pub const OwnedConn = struct {
+        stream: Io.net.Stream,
+        rbuf: [8192]u8 = undefined,
+        wbuf: [8192]u8 = undefined,
+        sr: Io.net.Stream.Reader = undefined,
+        sw: Io.net.Stream.Writer = undefined,
+    };
+
     pub fn deinit(self: *Channel) void {
         self.h2c.deinit();
+        if (self.owned) |oc| {
+            oc.stream.close(self.io);
+            self.gpa.destroy(oc);
+        }
+        if (self.authority_owned) self.gpa.free(self.opts.authority);
+    }
+
+    /// Dials plaintext h2c TCP (prior knowledge) and initializes the channel.
+    /// `host` may be an IP literal or a hostname. The channel owns the socket.
+    /// For TLS, wrap your own reader/writer and use `init` instead.
+    pub fn connectTcp(self: *Channel, io: Io, gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Options) !void {
+        const oc = try gpa.create(OwnedConn);
+        errdefer gpa.destroy(oc);
+        oc.* = .{ .stream = undefined };
+        if (Io.net.IpAddress.parse(host, port)) |a| {
+            var addr = a;
+            oc.stream = try addr.connect(io, .{ .mode = .stream });
+        } else |_| {
+            const hn = try Io.net.HostName.init(host);
+            oc.stream = try hn.connect(io, port, .{ .mode = .stream });
+        }
+        errdefer oc.stream.close(io);
+        oc.sr = oc.stream.reader(io, &oc.rbuf);
+        oc.sw = oc.stream.writer(io, &oc.wbuf);
+
+        var o = opts;
+        var auth_owned = false;
+        if (o.authority.len == 0) {
+            o.authority = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ host, port });
+            auth_owned = true;
+        }
+        errdefer if (auth_owned) gpa.free(o.authority);
+
+        try self.init(io, gpa, &oc.sr.interface, &oc.sw.interface, o);
+        self.owned = oc;
+        self.authority_owned = auth_owned;
     }
 
     /// Opens a bytes-level call: sends request HEADERS, returns the RawCall.
@@ -163,4 +211,63 @@ test "reserved metadata names are rejected" {
     try testing.expectError(error.ReservedMetadataName, lb.chan.startRaw("/x", .{
         .metadata = &.{.{ .name = "grpc-timeout", .value = "1S" }},
     }));
+}
+
+// ---- Task 10: connectTcp test ----
+
+fn tcpOkHandler(ctx: *h2.Context) anyerror!void {
+    if (ctx.body_reader) |br| {
+        var tmp: [64]u8 = undefined;
+        while (true) {
+            if (try br.read(&tmp) == 0) break;
+        }
+    }
+    ctx.res.status(200);
+    try ctx.res.header("content-type", "application/grpc");
+    try ctx.res.trailer("grpc-status", "0");
+    try ctx.res.finish();
+}
+
+const TcpSrv = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    srv: *h2.Server,
+
+    fn run(self: *TcpSrv) void {
+        var accepted = self.listener.accept(self.io) catch return;
+        defer accepted.close(self.io);
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
+        var sr = accepted.reader(self.io, &rbuf);
+        var sw = accepted.writer(self.io, &wbuf);
+        h2.serveConn(self.srv, &sr.interface, &sw.interface, null, "http");
+    }
+};
+
+test "connectTcp dials h2c and completes a call" {
+    const io = testing.io;
+    const addr0 = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr0.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.ip4.port;
+
+    var srv: h2.Server = .{ .io = io, .gpa = testing.allocator, .handler = tcpOkHandler };
+    var tsrv: TcpSrv = .{ .io = io, .listener = &listener, .srv = &srv };
+    const th = try std.Thread.spawn(.{}, TcpSrv.run, .{&tsrv});
+
+    var chan: Channel = undefined;
+    try chan.connectTcp(io, testing.allocator, "127.0.0.1", port, .{});
+
+    var call = try chan.startRaw("/test.Svc/Ok", .{});
+    try call.sendMessage("x");
+    try call.closeSend();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expect((try call.finish()).isOk());
+    // authority auto-filled
+    try testing.expect(std.mem.startsWith(u8, chan.opts.authority, "127.0.0.1:"));
+    call.deinit();
+    chan.deinit(); // close socket → server reads EOF → thread exits
+    th.join();
 }
