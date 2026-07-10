@@ -22,6 +22,7 @@ const call_mod = @import("call.zig");
 const channel_mod = @import("channel.zig");
 pub const CallOptions = call_mod.CallOptions;
 pub const RawCall = call_mod.RawCall;
+pub const Call = call_mod.Call;
 pub const Channel = channel_mod.Channel;
 
 test {

@@ -282,6 +282,53 @@ fn parseTrailerStatus(arena: std.mem.Allocator, hs: []const h2.hpack.Header, tra
     return .{ .code = .internal, .message = "missing grpc-status in trailers" };
 }
 
+/// Typed wrapper over RawCall for a comptime Method value. Same lifecycle
+/// and threading rules as RawCall.
+pub fn Call(comptime M: anytype) type {
+    const Req = @TypeOf(M).Req;
+    const Res = @TypeOf(M).Res;
+    return struct {
+        raw: RawCall,
+
+        const Self = @This();
+
+        pub fn send(self: *Self, msg: Req) !void {
+            const bytes = try M.encode_req(self.raw.chan.gpa, msg);
+            defer self.raw.chan.gpa.free(bytes);
+            try self.raw.sendMessage(bytes);
+        }
+
+        pub fn recv(self: *Self, arena: std.mem.Allocator) !?Res {
+            const bytes = (try self.raw.recvMessage(arena)) orelse return null;
+            return try M.decode_res(arena, bytes);
+        }
+
+        pub fn closeSend(self: *Self) !void {
+            return self.raw.closeSend();
+        }
+
+        pub fn header(self: *Self) !Metadata {
+            return self.raw.header();
+        }
+
+        pub fn finish(self: *Self) !Status {
+            return self.raw.finish();
+        }
+
+        pub fn trailers(self: *const Self) Metadata {
+            return self.raw.trailers();
+        }
+
+        pub fn cancel(self: *Self) void {
+            self.raw.cancel();
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.raw.deinit();
+        }
+    };
+}
+
 // ---- Task 7: receive state machine tests ----
 
 // Hand-write gRPC message frames (server side). Prefix and payload go in two
@@ -545,4 +592,85 @@ test "compressed-flag message errors and surfaces internal status" {
     defer arena_state.deinit();
     try testing.expectError(error.CompressedUnsupported, call.recvMessage(arena_state.allocator()));
     try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+}
+
+// ---- Task 9: typed Call(M) / start / unary tests ----
+
+const codec_mod = @import("codec.zig");
+const TestMsg = struct {
+    text: []const u8 = "",
+
+    pub fn encode(self: TestMsg, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, self.text);
+    }
+
+    pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !TestMsg {
+        return .{ .text = try arena.dupe(u8, bytes) };
+    }
+};
+const EchoM = codec_mod.Method(TestMsg, TestMsg){ .path = "/test.Svc/Echo" };
+
+test "typed unary convenience round-trips" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, unaryEchoHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const reply = try lb.chan.unary(EchoM, arena_state.allocator(), .{ .text = "ping" }, .{});
+    try testing.expectEqualStrings("ping", reply.text);
+}
+
+test "typed unary surfaces non-OK via error.RpcFailed and status_out" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, notFoundHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var st: Status = undefined;
+    try testing.expectError(error.RpcFailed, lb.chan.unary(
+        EchoM,
+        arena_state.allocator(),
+        .{ .text = "x" },
+        .{ .status_out = &st },
+    ));
+    try testing.expectEqual(status_mod.Code.not_found, st.code);
+    try testing.expectEqualStrings("no such thing", st.message);
+}
+
+fn bidiEchoHandler(ctx: *h2.Context) anyerror!void {
+    ctx.res.status(200);
+    try ctx.res.header("content-type", "application/grpc");
+    if (ctx.body_reader) |br| {
+        var tmp: [512]u8 = undefined;
+        while (true) {
+            const n = try br.read(&tmp);
+            if (n == 0) break;
+            try ctx.res.write(tmp[0..n]); // read-and-echo: full-duplex ping-pong
+        }
+    }
+    try ctx.res.trailer("grpc-status", "0");
+    try ctx.res.finish();
+}
+
+test "typed bidi ping-pong on one stream" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, bidiEchoHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var call = try lb.chan.start(EchoM, .{});
+    defer call.deinit();
+
+    try call.send(.{ .text = "one" });
+    try testing.expectEqualStrings("one", (try call.recv(arena)).?.text);
+    try call.send(.{ .text = "two" });
+    try testing.expectEqualStrings("two", (try call.recv(arena)).?.text);
+    try call.closeSend();
+    try testing.expect((try call.recv(arena)) == null);
+    try testing.expect((try call.finish()).isOk());
 }

@@ -61,6 +61,34 @@ pub const Channel = struct {
         }, false);
         return call_mod.RawCall.init(self, s);
     }
+
+    /// Opens a typed call for a comptime Method value.
+    pub fn start(self: *Channel, comptime M: anytype, call_opts: call_mod.CallOptions) !call_mod.Call(M) {
+        return .{ .raw = try self.startRaw(M.path, call_opts) };
+    }
+
+    /// One-shot unary RPC: send → half-close → receive one → status check.
+    /// Non-OK becomes error.RpcFailed with the status (message duped into
+    /// `arena`) written to `call_opts.status_out` when provided.
+    pub fn unary(
+        self: *Channel,
+        comptime M: anytype,
+        arena: std.mem.Allocator,
+        req: @TypeOf(M).Req,
+        call_opts: call_mod.CallOptions,
+    ) !@TypeOf(M).Res {
+        var c = try self.start(M, call_opts);
+        defer c.deinit();
+        try c.send(req);
+        try c.closeSend();
+        const res = try c.recv(arena);
+        const st = try c.finish();
+        if (call_opts.status_out) |out| {
+            out.* = .{ .code = st.code, .message = try arena.dupe(u8, st.message) };
+        }
+        if (!st.isOk()) return error.RpcFailed;
+        return res orelse error.MissingResponse;
+    }
 };
 
 const testing = std.testing;
