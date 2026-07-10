@@ -1,0 +1,14 @@
+.{
+    .name = .zig_grpc,
+    .version = "0.1.0",
+    .fingerprint = 0xe32e066f4b1ab5fb,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zig_http2 = .{ .path = "../zig-http2" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
