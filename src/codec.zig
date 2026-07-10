@@ -16,18 +16,60 @@ pub fn Method(comptime RequestT: type, comptime ResponseT: type) type {
     };
 }
 
+/// Whether `T.encode` uses the current zig-protobuf Io signature
+/// `encode(self, *std.Io.Writer, allocator)` (vs the legacy `encode(self, allocator) []u8`).
+fn encodesViaWriter(comptime T: type) bool {
+    const info = @typeInfo(@TypeOf(@field(T, "encode")));
+    if (info != .@"fn") return false;
+    const params = info.@"fn".params;
+    if (params.len >= 2) {
+        if (params[1].type) |pt| return pt == *std.Io.Writer;
+    }
+    return false;
+}
+
+/// Whether `T.decode` uses the current zig-protobuf Io signature
+/// `decode(*std.Io.Reader, allocator)` (vs the legacy `decode(allocator, bytes)`).
+fn decodesViaReader(comptime T: type) bool {
+    const info = @typeInfo(@TypeOf(@field(T, "decode")));
+    if (info != .@"fn") return false;
+    const params = info.@"fn".params;
+    if (params.len >= 1) {
+        if (params[0].type) |pt| return pt == *std.Io.Reader;
+    }
+    return false;
+}
+
 fn defaultEncode(comptime T: type) *const fn (std.mem.Allocator, T) anyerror![]u8 {
     return &struct {
+        const new_style = encodesViaWriter(T);
         fn enc(gpa: std.mem.Allocator, msg: T) anyerror![]u8 {
-            return msg.encode(gpa);
+            if (new_style) {
+                // zig-protobuf Io API: encode(self, *std.Io.Writer, allocator)
+                var aw: std.Io.Writer.Allocating = .init(gpa);
+                errdefer aw.deinit();
+                try msg.encode(&aw.writer, gpa);
+                return aw.toOwnedSlice();
+            } else {
+                // legacy: encode(self, allocator) []u8
+                return msg.encode(gpa);
+            }
         }
     }.enc;
 }
 
 fn defaultDecode(comptime T: type) *const fn (std.mem.Allocator, []const u8) anyerror!T {
     return &struct {
+        const new_style = decodesViaReader(T);
         fn dec(arena: std.mem.Allocator, bytes: []const u8) anyerror!T {
-            return T.decode(arena, bytes);
+            if (new_style) {
+                // zig-protobuf Io API: decode(*std.Io.Reader, allocator)
+                var r = std.Io.Reader.fixed(bytes);
+                return T.decode(&r, arena);
+            } else {
+                // legacy: decode(allocator, bytes)
+                return T.decode(arena, bytes);
+            }
         }
     }.dec;
 }
