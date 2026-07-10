@@ -127,7 +127,7 @@ pub const RawCall = struct {
     pub fn header(self, arena: Allocator) !Metadata;     // 阻塞至响应 HEADERS 到达
     pub fn finish(self) !Status;      // recvMessage 返回 null 后取最终状态
     pub fn trailers(self) Metadata;   // finish 之后可用
-    pub fn cancel(self) void;         // RST_STREAM(CANCEL),可从任意线程调
+    pub fn cancel(self) void;         // RST_STREAM(CANCEL);通知对端,不打断阻塞中的 recv(见线程模型)
     pub fn deinit(self) void;
 };
 
@@ -176,8 +176,9 @@ RawCall 消费 `h2.Stream.readEvent`:
 
 ### 线程模型与限制(v1 明确接受)
 
-- 每个 call 最多一个发送线程 + 一个接收线程(继承 h2.Stream 约束);`cancel()` 可从任意线程调;`deinit` 不得与 send/recv 并发。
-- client 侧不本地强制 deadline(阻塞读无超时):`grpc-timeout` 交服务端执行,调用方可从别的线程 `cancel()`。
+- 每个 call 最多一个发送线程 + 一个接收线程(继承 h2.Stream 约束);`deinit` 不得与 send/recv 并发。
+- `cancel()` 线程安全,但语义仅是**通知对端取消**(RST_STREAM)并释放并发流槽位:当前 zig-http2 的 `Stream.cancel()`(client.zig:222)不会把本地流标成 reset,也不会唤醒阻塞中的 `readEvent`(其本地退出全依赖对端/连接侧事件,client.zig:195-216)。对一个正阻塞在 `recv` 的线程,`cancel()` **不保证使其返回**——对端收到 RST 后不再发帧,阻塞可能一直持续到连接层有其他活动。
+- 因此 **client 本地 deadline v1 不支持**:只能发 `grpc-timeout` 头交服务端执行,本地阻塞接收无法被现有 API 强制超时打断。可用的取消姿势是:接收线程自己决定不再 `recv` 并调 `cancel()`/`deinit`。本地可打断阻塞接收的能力列为 zig-http2 缺口(见文末清单)。
 
 ## Server 骨架(仅定形态)
 
@@ -216,10 +217,10 @@ pub const Server = struct {
 | 流式请求体 + 半关 | ✅ `Stream.send(data, end_stream)`,空 DATA 半关 |
 | 响应 trailers(区分首/尾 HEADERS) | ✅ `Event.headers` + `end_stream` 标志 |
 | 双向并发读写 | ✅ 一发送线程 + 一接收线程 |
-| 跨线程取消 | ✅ `Stream.cancel()` |
+| 通知对端取消(RST_STREAM) | ✅ `Stream.cancel()`(仅发帧 + 释放并发槽,见下行缺口) |
 | 接收侧流控背压 | ✅ 消费时才补窗 |
 | GOAWAY 优雅处理 / 可重试判定 | ✅ `Event.goaway` + refused 语义 |
 | MAX_CONCURRENT_STREAMS 准入 | ✅ `openStream` 阻塞准入 |
-| **readEvent 超时 / deadline** | ❌ 无超时参数 → v1 接受(server 端强制 + 跨线程 cancel);若后续做 client 本地 deadline,需在 zig-http2 增加 |
+| **可本地打断阻塞接收** | ❌ 缺口。`cancel()` 不设置本地 reset、不广播 `recv_cond`(client.zig:222 → noteEnd client.zig:391),阻塞中的 `readEvent` 只能由对端/连接侧事件唤醒(client.zig:195-216)。缺的能力形式可以是 `readEvent` 超时参数,或本地 abort/wake API(置流为 aborted 并 broadcast)。影响:client 本地 deadline、跨线程取消阻塞接收。**不阻塞首个互通里程碑**,但属 zig-http2 侧必做后续项——gRPC 的取消语义(对标 Go 的 context cancel)依赖它。 |
 
 实现中新发现的缺口按"工作约定"一节处理:上报 → zig-http2 修复 → 继续。
