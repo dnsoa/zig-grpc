@@ -42,6 +42,11 @@ pub const Channel = struct {
     };
 
     pub fn deinit(self: *Channel) void {
+        // 先 shutdown 自有传输（connectTcp 的 socket），让 h2 reader 线程阻塞的 I/O 读收到
+        // 干净 EOF（而非 close 的 EBADF——后者在 io 后端会 panic "programmer bug"）、退出；
+        // 否则下面 h2c.deinit 的 reader_thread.join 会挂（持久 HTTP/2 server 是常态——
+        // reader 阻塞在 readFrameHeader，dead+broadcast 唤不醒 I/O 读）。
+        if (self.owned) |oc| oc.stream.shutdown(self.io, .both) catch {};
         self.h2c.deinit();
         if (self.owned) |oc| {
             oc.stream.close(self.io);

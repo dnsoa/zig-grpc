@@ -61,8 +61,8 @@ pub const RawCall = struct {
     /// Half-closes the request direction (empty DATA + END_STREAM).
     pub fn closeSend(self: *RawCall) !void {
         if (self.send_closed) return;
-        self.send_closed = true;
         try self.stream.send("", true);
+        self.send_closed = true; // 置位在 send 之后：失败则可重试（否则 server 永远等不到 END_STREAM）
     }
 
     /// Tells the server to cancel (RST_STREAM CANCEL). Safe to call from a
