@@ -4,7 +4,10 @@
     .fingerprint = 0xe32e066f4b1ab5fb,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .zig_http2 = .{ .path = "../zig-http2" },
+        .zig_http2 = .{
+            .url = "https://github.com/dnsoa/zig-http2/archive/a2745c7b01b91975905827e9645ac28b2946d726.tar.gz",
+            .hash = "zig_http2-0.1.0-ifV7SIZ5BQA2M2RNPVuV-jKG7Bu1rIMU_f-SikrbNqRx",
+        },
     },
     .paths = .{
         "build.zig",
