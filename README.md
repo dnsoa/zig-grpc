@@ -1,6 +1,6 @@
 # zig-grpc
 
-gRPC for Zig, built on [zig-http2](../zig-http2). The core is bytes-in / bytes-out
+gRPC for Zig, built on [zig-http2](https://github.com/dnsoa/zig-http2). The core is bytes-in / bytes-out
 (HTTP/2 + gRPC framing); message encode/decode plugs in through a comptime
 contract, so any protobuf library (or hand-rolled struct) works without the
 runtime taking a dependency on one.
@@ -11,7 +11,7 @@ bidirectional streaming all work against a real grpc-go server
 method registry); the connection-serving path is later work.
 
 - Zig 0.16.0 (`std.Io` model)
-- Single dependency: `zig_http2` (path `../zig-http2`)
+- Single dependency: [`zig_http2`](https://github.com/dnsoa/zig-http2), pinned by commit + hash in `build.zig.zon`
 - Plaintext h2c only (TLS is the caller's job — wrap your own reader/writer)
 
 ## Quickstart
