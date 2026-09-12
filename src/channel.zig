@@ -6,6 +6,7 @@ const std = @import("std");
 const h2 = @import("zig_http2");
 const call_mod = @import("call.zig");
 const metadata_mod = @import("metadata.zig");
+const status_mod = @import("status.zig");
 const Io = std.Io;
 
 pub const Channel = struct {
@@ -147,8 +148,10 @@ pub const Channel = struct {
     }
 
     /// One-shot unary RPC: send → half-close → receive one → status check.
-    /// Non-OK becomes error.RpcFailed with the status (message duped into
-    /// `arena`) written to `call_opts.status_out` when provided.
+    /// Non-OK becomes error.RpcFailed. `call_opts.status_out`, when provided,
+    /// always receives the final Status — including for a transport failure
+    /// that never produced one, so a caller can decide on retryability from a
+    /// code instead of an opaque Zig error.
     pub fn unary(
         self: *Channel,
         comptime M: anytype,
@@ -156,19 +159,63 @@ pub const Channel = struct {
         req: @TypeOf(M).Req,
         call_opts: call_mod.CallOptions,
     ) !@TypeOf(M).Res {
-        var c = try self.start(M, call_opts);
+        var c = self.start(M, call_opts) catch |e| {
+            // No call exists yet, so there is no RawCall.stat to prefer.
+            writeStatus(call_opts, arena, .{
+                .code = status_mod.codeFromTransportError(e),
+                .message = @errorName(e),
+            });
+            return e;
+        };
         defer c.deinit();
-        try c.send(req);
-        try c.closeSend();
-        const res = try c.recv(arena);
-        const st = try c.finish();
-        if (call_opts.status_out) |out| {
-            out.* = .{ .code = st.code, .message = try arena.dupe(u8, st.message) };
-        }
+
+        c.send(req) catch |e| {
+            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
+        c.closeSend() catch |e| {
+            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
+        const res = c.recv(arena) catch |e| {
+            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
+        const st = c.finish() catch |e| {
+            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
+
+        writeStatus(call_opts, arena, st);
         if (!st.isOk()) return error.RpcFailed;
-        return res orelse error.MissingResponse;
+        if (res == null) {
+            // OK trailers but no message: the server broke the unary contract.
+            writeStatus(call_opts, arena, .{
+                .code = .internal,
+                .message = "server ended the call without a response message",
+            });
+            return error.MissingResponse;
+        }
+        return res.?;
     }
 };
+
+/// Copies `st` into `call_opts.status_out`, duping the message into `arena` —
+/// a status read off the call points into the call's arena, which dies with it.
+fn writeStatus(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, st: call_mod.Status) void {
+    const out = call_opts.status_out orelse return;
+    out.* = .{ .code = st.code, .message = arena.dupe(u8, st.message) catch "" };
+}
+
+/// Records a mid-call failure. The RawCall's own mapping wins when it has one
+/// (it saw the RST code / HTTP status / trailers); the raw error is only a
+/// fallback for failures that never reached a status.
+fn recordFailure(raw: *const call_mod.RawCall, call_opts: call_mod.CallOptions, arena: std.mem.Allocator, err: anyerror) void {
+    writeStatus(call_opts, arena, raw.stat orelse .{
+        .code = status_mod.codeFromTransportError(err),
+        .message = @errorName(err),
+    });
+}
 
 const testing = std.testing;
 const testutil = @import("testutil.zig");
@@ -332,4 +379,79 @@ test "live_calls tracks outstanding calls so deinit can refuse to strand one" {
     b.deinit();
     // Back to zero, so lb.stop()'s chan.deinit() passes its check.
     try testing.expectEqual(@as(u32, 0), lb.chan.live_calls.load(.acquire));
+}
+
+const codec_mod = @import("codec.zig");
+const UnaryMsg = struct {
+    text: []const u8 = "",
+
+    pub fn encode(self: UnaryMsg, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, self.text);
+    }
+
+    pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !UnaryMsg {
+        return .{ .text = try arena.dupe(u8, bytes) };
+    }
+};
+const UnaryM = codec_mod.Method(UnaryMsg, UnaryMsg){ .path = "/test.Svc/Unary" };
+
+test "unary reports a setup failure as a status, not just a Zig error" {
+    // A peer GOAWAY makes the next openStream fail with error.GoingAway. The
+    // caller needs to know that is retryable on a fresh connection, and an
+    // error name does not say so — status_out must carry `unavailable`.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var goaway: [8]u8 = @splat(0); // last_stream_id = 0, NO_ERROR
+    try rp.writeFrame(.goaway, 0, 0, &goaway);
+
+    // Wait for the client's reader to record it.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (rp.chan.h2c.goAway() != null) break;
+        std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var st: status_mod.Status = undefined;
+    try testing.expectError(error.GoingAway, rp.chan.unary(
+        UnaryM,
+        arena_state.allocator(),
+        .{ .text = "x" },
+        .{ .status_out = &st },
+    ));
+    try testing.expectEqual(status_mod.Code.unavailable, st.code);
+    try testing.expectEqualStrings("GoingAway", st.message);
+}
+
+test "unary reports the OK status too, not only failures" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, unaryOkHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var st: status_mod.Status = .{ .code = .unknown, .message = "untouched" };
+    const reply = try lb.chan.unary(UnaryM, arena_state.allocator(), .{ .text = "ping" }, .{ .status_out = &st });
+    try testing.expectEqualStrings("ping", reply.text);
+    try testing.expectEqual(status_mod.Code.ok, st.code);
+}
+
+fn unaryOkHandler(ctx: *h2.Context) anyerror!void {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    if (ctx.body_reader) |br| {
+        while (true) {
+            const r = try br.read(buf[n..]);
+            if (r == 0) break;
+            n += r;
+        }
+    }
+    ctx.res.status(200);
+    try ctx.res.header("content-type", "application/grpc");
+    try ctx.res.write(buf[0..n]);
+    try ctx.res.trailer("grpc-status", "0");
+    try ctx.res.finish();
 }

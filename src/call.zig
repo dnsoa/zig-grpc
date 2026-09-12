@@ -7,6 +7,7 @@ const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const frame = @import("frame.zig");
 const channel_mod = @import("channel.zig");
+const Io = std.Io;
 
 const testing = std.testing;
 const testutil = @import("testutil.zig");
@@ -20,7 +21,10 @@ pub const CallOptions = struct {
     /// deadline timer — to abort a blocked recv early, call `cancel()` from
     /// another thread.
     timeout_ns: ?u64 = null,
-    /// For `Channel.unary` only: receives the final Status on non-OK.
+    /// For `Channel.unary` only: receives the call's final Status — on success,
+    /// on a non-OK status, and on a transport failure that never produced one
+    /// (mapped via `status.codeFromTransportError`). The message is duped into
+    /// the arena passed to `unary`.
     status_out: ?*Status = null,
 };
 
@@ -35,6 +39,17 @@ pub const RawCall = struct {
     resp_trailers: Metadata = .{},
     stat: ?Status = null,
     send_closed: bool = false,
+    /// Serializes the receive path. `recvMessage`, `header` and `finish` all
+    /// drive `step()`, which mutates `state`/`stat`/`resp_headers`/`arena_state`
+    /// /`assembler` with no other protection — zig-http2 makes `readEvent`
+    /// thread-safe per stream, but that protects the transport, not this call.
+    /// `cancel()` deliberately stays outside: it touches only the h2 stream, so
+    /// it can still break a receiver out of a blocking read.
+    recv_mu: Io.Mutex = .init,
+    /// Set once the response-head phase has a verdict — initial HEADERS
+    /// decoded, or the stream ended some other way. Lets `header()` answer
+    /// without taking `recv_mu`; see the fast path there.
+    head_settled: std.atomic.Value(bool) = .init(false),
 
     const State = enum { awaiting_headers, open, done };
 
@@ -92,8 +107,20 @@ pub const RawCall = struct {
     /// Reads the next response message into `arena`. Returns null once the
     /// server has finished (trailers received) — then `finish()` has the
     /// status. Transport faults are Zig errors; `stat` still carries the
-    /// mapped gRPC status afterwards. One receiver thread per call.
+    /// mapped gRPC status afterwards.
+    ///
+    /// Serialized against `header()`/`finish()` via `recv_mu`, so calling them
+    /// from different threads is safe; it is still one *logical* receiver
+    /// (whoever gets the lock consumes the next event).
     pub fn recvMessage(self: *RawCall, arena: std.mem.Allocator) !?[]u8 {
+        self.recv_mu.lockUncancelable(self.chan.io);
+        defer self.recv_mu.unlock(self.chan.io);
+        return self.recvLocked(arena);
+    }
+
+    /// `recv_mu` held. `finish()` reuses this instead of `recvMessage` because
+    /// `Io.Mutex` is not reentrant.
+    fn recvLocked(self: *RawCall, arena: std.mem.Allocator) !?[]u8 {
         while (true) {
             const maybe = self.assembler.next(arena) catch |e| {
                 if (self.stat == null) self.stat = switch (e) {
@@ -118,7 +145,16 @@ pub const RawCall = struct {
 
     /// Blocks until the response HEADERS arrive; empty for Trailers-Only.
     /// The returned Metadata is owned by the call (valid until deinit).
+    /// Safe to call from a thread other than the one in `recvMessage`.
     pub fn header(self: *RawCall) !Metadata {
+        // Fast path: once the head phase has settled, `resp_headers` is frozen
+        // (later HEADERS land in `resp_trailers`), so answer without the lock.
+        // Taking it here would block behind a receiver parked in readEvent
+        // waiting for the *next* message — on a server-streaming call that can
+        // be an unbounded wait for a value we already have.
+        if (self.head_settled.load(.acquire)) return self.resp_headers orelse .{};
+        self.recv_mu.lockUncancelable(self.chan.io);
+        defer self.recv_mu.unlock(self.chan.io);
         while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
         return self.resp_headers orelse .{};
     }
@@ -127,10 +163,12 @@ pub const RawCall = struct {
     /// after recvMessage returned null (for streams) or directly (unary
     /// convenience). NOTE: blocks until the server ends the stream.
     pub fn finish(self: *RawCall) !Status {
+        self.recv_mu.lockUncancelable(self.chan.io);
+        defer self.recv_mu.unlock(self.chan.io);
         var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
         defer scratch.deinit();
         while (self.state != .done) {
-            _ = self.recvMessage(scratch.allocator()) catch break;
+            _ = self.recvLocked(scratch.allocator()) catch break;
             _ = scratch.reset(.retain_capacity);
         }
         return self.stat orelse .{ .code = .internal, .message = "call ended without status" };
@@ -142,8 +180,12 @@ pub const RawCall = struct {
         return self.resp_trailers;
     }
 
-    /// Consumes one h2 event and advances the call state machine.
+    /// Consumes one h2 event and advances the call state machine. `recv_mu` held.
     fn step(self: *RawCall) !void {
+        // Publish the head-phase verdict on every exit path (including the
+        // error ones). Release pairs with header()'s acquire, so a reader that
+        // sees the flag also sees the `resp_headers`/`state` writes behind it.
+        defer if (self.state != .awaiting_headers) self.head_settled.store(true, .release);
         var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
         defer scratch.deinit();
         const ev = self.stream.readEvent(scratch.allocator()) catch |e| switch (e) {
@@ -837,4 +879,88 @@ test "header() ends on DATA-before-HEADERS instead of buffering forever" {
     try testing.expectEqual(@as(usize, 0), w.entries); // Trailers-Only-shaped empty
     try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
     try testing.expect(!call.assembler.hasPartial()); // nothing was buffered
+}
+
+/// Blocks in `recvMessage` waiting for a message the peer never sends, so a
+/// test can check what another thread's `header()` does while it holds nothing
+/// but a parked `readEvent`.
+const BlockedRecv = struct {
+    call: *RawCall,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BlockedRecv) void {
+        var a = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer a.deinit();
+        _ = self.call.recvMessage(a.allocator()) catch {};
+        self.done.store(true, .release);
+    }
+};
+
+const HeaderRacer = struct {
+    call: *RawCall,
+    saw_content_type: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *HeaderRacer) void {
+        if (self.call.header()) |md| {
+            self.saw_content_type = md.get("content-type") != null;
+        } else |_| {}
+        self.done.store(true, .release);
+    }
+};
+
+test "header() answers while another thread is parked in recvMessage" {
+    // Serializing the receive path on one mutex is right, but `header()` must
+    // not queue behind a receiver waiting for the *next* message: on a
+    // server-streaming call that is an unbounded wait for a value already in
+    // hand. The head_settled fast path is what makes this return.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Response headers only — no message, no trailers.
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    // Receiver consumes those HEADERS and then parks waiting for DATA.
+    var recv: BlockedRecv = .{ .call = &call };
+    const th_recv = try std.Thread.spawn(.{}, BlockedRecv.run, .{&recv});
+    std.Io.sleep(testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+
+    var racer: HeaderRacer = .{ .call = &call };
+    const th_hdr = try std.Thread.spawn(.{}, HeaderRacer.run, .{&racer});
+    var header_returned = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (racer.done.load(.acquire)) {
+            header_returned = true;
+            break;
+        }
+        std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    // Sample before unblocking: the receiver must still be parked, which is
+    // what makes this a real test of the fast path rather than of timing.
+    const recv_still_parked = !recv.done.load(.acquire);
+
+    // Release everyone: trailers end the stream.
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+    th_recv.join();
+    th_hdr.join();
+
+    try testing.expect(header_returned);
+    try testing.expect(recv_still_parked);
+    try testing.expect(racer.saw_content_type);
 }

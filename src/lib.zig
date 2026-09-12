@@ -6,6 +6,9 @@ const std = @import("std");
 const status_mod = @import("status.zig");
 pub const Code = status_mod.Code;
 pub const Status = status_mod.Status;
+/// Maps a transport-level error onto a gRPC code — for callers driving
+/// `startRaw`/`RawCall` directly, where there is no Status to read.
+pub const codeFromTransportError = status_mod.codeFromTransportError;
 
 const metadata_mod = @import("metadata.zig");
 pub const Metadata = metadata_mod.Metadata;
