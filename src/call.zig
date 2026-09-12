@@ -39,6 +39,9 @@ pub const RawCall = struct {
     const State = enum { awaiting_headers, open, done };
 
     pub fn init(chan: *channel_mod.Channel, stream: *h2.Stream) RawCall {
+        // Paired with the decrement in `deinit`; `Channel.deinit` refuses to run
+        // while any call is outstanding, because it frees the streams they hold.
+        _ = chan.live_calls.fetchAdd(1, .monotonic);
         return .{
             .chan = chan,
             .stream = stream,
@@ -76,11 +79,14 @@ pub const RawCall = struct {
         self.stream.cancel() catch {};
     }
 
-    /// Releases the call. Must not race a concurrent sendMessage/recvMessage.
+    /// Releases the call. Must not race a concurrent sendMessage/recvMessage,
+    /// and must happen before the owning `Channel` is deinit'd — the channel
+    /// frees the underlying h2 stream.
     pub fn deinit(self: *RawCall) void {
         self.stream.close();
         self.assembler.deinit();
         self.arena_state.deinit();
+        _ = self.chan.live_calls.fetchSub(1, .monotonic);
     }
 
     /// Reads the next response message into `arena`. Returns null once the
@@ -163,6 +169,21 @@ pub const RawCall = struct {
         switch (ev) {
             .headers => |hd| try self.onHeaders(hd.headers, hd.end_stream),
             .data => |d| {
+                // A gRPC response opens with HEADERS; DATA before them belongs
+                // to no valid response. Buffering it anyway was wrong twice
+                // over: the bytes surfaced as a legitimate message, and
+                // `header()` drives `step()` WITHOUT calling `assembler.next()`,
+                // so `max_recv_message_size` never got a chance to fire and a
+                // peer could grow the assembler without bound while we waited
+                // for headers that never came.
+                if (self.state == .awaiting_headers) {
+                    if (self.stat == null) self.stat = .{
+                        .code = .internal,
+                        .message = "DATA received before response headers",
+                    };
+                    self.abandon();
+                    return;
+                }
                 try self.assembler.feed(d.payload);
                 if (d.end_stream) {
                     // A gRPC response must end with trailers; DATA+END_STREAM is a violation.
@@ -716,4 +737,104 @@ test "typed bidi ping-pong on one stream" {
     try call.closeSend();
     try testing.expect((try call.recv(arena)) == null);
     try testing.expect((try call.finish()).isOk());
+}
+
+test "DATA before response HEADERS is a protocol error, not a message" {
+    // Previously the bytes were fed into the assembler and surfaced as a
+    // perfectly ordinary message with an OK status. `header()` also drives
+    // step() without ever calling assembler.next(), so max_recv_message_size
+    // never applied and a peer could grow the buffer without bound.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // A complete, well-formed gRPC message — but sent before any HEADERS.
+    const msg = [_]u8{ 0, 0, 0, 0, 4 } ++ "oops".*;
+    try rp.writeFrame(.data, 0, sid, &msg);
+    // Then a response that would otherwise look entirely normal.
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // No message is delivered, and the call ends internal rather than OK.
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    const st = try call.finish();
+    try testing.expectEqual(status_mod.Code.internal, st.code);
+    try testing.expectEqualStrings("DATA received before response headers", st.message);
+    // abandon() tells the server to stop.
+    const rst = try rp.readUntil(.rst_stream);
+    testing.allocator.free(rst.payload);
+}
+
+/// Runs the blocking `header()` on its own thread so the test can put a
+/// deadline on it: without the DATA-before-HEADERS guard, `header()` never
+/// returns (it keeps consuming DATA and waiting for headers that never come),
+/// and a test that called it inline would hang the suite instead of failing.
+const HeaderWaiter = struct {
+    call: *RawCall,
+    entries: usize = 0,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *HeaderWaiter) void {
+        if (self.call.header()) |md| {
+            self.entries = md.entries.len;
+        } else |e| self.err = e;
+        self.done.store(true, .release);
+    }
+};
+
+test "header() ends on DATA-before-HEADERS instead of buffering forever" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // The unbounded path: header() loops on step() and never calls
+    // assembler.next(), so each of these used to be appended with no size cap.
+    var chunk: [1024]u8 = @splat('x');
+    var i: usize = 0;
+    while (i < 8) : (i += 1) try rp.writeFrame(.data, 0, sid, &chunk);
+
+    var w: HeaderWaiter = .{ .call = &call };
+    const th = try std.Thread.spawn(.{}, HeaderWaiter.run, .{&w});
+    var finished = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (w.done.load(.acquire)) {
+            finished = true;
+            break;
+        }
+        std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    // Release the thread either way so join() returns and the failure below is
+    // what reports the problem.
+    if (!finished) call.cancel();
+    th.join();
+
+    try testing.expect(finished);
+    try testing.expectEqual(@as(usize, 0), w.entries); // Trailers-Only-shaped empty
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+    try testing.expect(!call.assembler.hasPartial()); // nothing was buffered
 }
