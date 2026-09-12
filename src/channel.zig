@@ -39,7 +39,16 @@ pub const Channel = struct {
     /// and only EOF/error on the transport gets it out — so deinit'ing a channel
     /// over a still-open connection hangs. `connectTcp` owns its socket and
     /// handles this itself; `init` callers must do it.
+    ///
+    /// `opts.authority` is required here. HTTP/2 requests carry `:authority`,
+    /// gRPC servers route and enforce TLS host checks on it, and
+    /// `hpack.Encoder.encodeRequest` simply omits the pseudo-header when the
+    /// value is empty — so defaulting to "" produced requests that a real
+    /// server (grpc-go among them) rejects, with nothing here to say why.
+    /// `connectTcp` derives `host:port`; over a transport we did not dial, only
+    /// the caller knows the authority.
     pub fn init(self: *Channel, io: Io, gpa: std.mem.Allocator, r: *Io.Reader, w: *Io.Writer, opts: Options) !void {
+        if (opts.authority.len == 0) return error.AuthorityRequired;
         self.* = .{ .io = io, .gpa = gpa, .h2c = undefined, .opts = opts };
         try self.h2c.init(io, gpa, r, w);
     }
@@ -181,11 +190,28 @@ pub const Channel = struct {
             recordFailure(&c.raw, call_opts, arena, e);
             return e;
         };
+        // A unary response is exactly one message. Reading again both catches a
+        // server that sent more and advances to the trailers, which `finish`
+        // needs anyway — so this costs no extra round trip on a well-behaved
+        // response, where it just returns null.
+        const extra = c.recv(arena) catch |e| {
+            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
         const st = c.finish() catch |e| {
             recordFailure(&c.raw, call_opts, arena, e);
             return e;
         };
 
+        if (extra != null) {
+            // Takes priority over the trailers' status: whatever the server
+            // meant to report, the response stream itself is malformed.
+            writeStatusBestEffort(call_opts, arena, .{
+                .code = .internal,
+                .message = "unary response carried more than one message",
+            });
+            return error.TooManyResponses;
+        }
         try writeStatus(call_opts, arena, st);
         if (!st.isOk()) return error.RpcFailed;
         if (res == null) {
@@ -465,4 +491,67 @@ fn unaryOkHandler(ctx: *h2.Context) anyerror!void {
     try ctx.res.write(buf[0..n]);
     try ctx.res.trailer("grpc-status", "0");
     try ctx.res.finish();
+}
+
+test "init refuses an empty authority instead of sending a request without one" {
+    // hpack.Encoder.encodeRequest omits :authority when the value is empty, so
+    // the old default produced requests a real gRPC server rejects, with
+    // nothing here to explain why.
+    //
+    // Driven over a fixed reader/writer rather than a socket: the check happens
+    // before the transport is touched, and this way an unfixed build (where
+    // init succeeds) can be cleaned up and reported instead of leaving a reader
+    // thread running past the end of this stack frame.
+    var rbuf: [1]u8 = undefined;
+    var r = std.Io.Reader.fixed(&rbuf);
+    var wbuf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&wbuf);
+
+    var chan: Channel = undefined;
+    if (chan.init(testing.io, testing.allocator, &r, &w, .{})) |_| {
+        chan.deinit(); // the fixed reader is already at EOF, so the join returns
+        return error.TestUnexpectedResult;
+    } else |e| {
+        try testing.expectEqual(error.AuthorityRequired, e);
+    }
+}
+
+fn twoMessageHandler(ctx: *h2.Context) anyerror!void {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    if (ctx.body_reader) |br| {
+        while (true) {
+            const r = try br.read(buf[n..]);
+            if (r == 0) break;
+            n += r;
+        }
+    }
+    ctx.res.status(200);
+    try ctx.res.header("content-type", "application/grpc");
+    // Two framed messages on a unary method — a server-side contract violation.
+    var prefix: [5]u8 = .{ 0, 0, 0, 0, 2 };
+    try ctx.res.write(&prefix);
+    try ctx.res.write("aa");
+    try ctx.res.write(&prefix);
+    try ctx.res.write("bb");
+    try ctx.res.trailer("grpc-status", "0");
+    try ctx.res.finish();
+}
+
+test "unary rejects a response carrying more than one message" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, twoMessageHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var st: status_mod.Status = undefined;
+    try testing.expectError(error.TooManyResponses, lb.chan.unary(
+        UnaryM,
+        arena_state.allocator(),
+        .{ .text = "x" },
+        .{ .status_out = &st },
+    ));
+    // The protocol violation wins over the (OK) trailers the server sent.
+    try testing.expectEqual(status_mod.Code.internal, st.code);
 }

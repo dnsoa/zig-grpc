@@ -33,13 +33,22 @@ const EchoMsg = struct {
             switch (@as(u3, @truncate(tag))) {
                 2 => {
                     const len = try readVarint(bytes, &i);
-                    if (i + len > bytes.len) return error.Malformed;
+                    // Subtract rather than add: a crafted varint length makes
+                    // `i + len` wrap, and the check would pass on the way to a
+                    // bogus slice. `readVarint` leaves i <= bytes.len.
+                    if (len > bytes.len - i) return error.Malformed;
                     if (field == 1) msg.message = try arena.dupe(u8, bytes[i..][0..len]);
                     i += len;
                 },
                 0 => _ = try readVarint(bytes, &i),
-                5 => i += 4,
-                1 => i += 8,
+                5 => {
+                    if (bytes.len - i < 4) return error.Malformed;
+                    i += 4;
+                },
+                1 => {
+                    if (bytes.len - i < 8) return error.Malformed;
+                    i += 8;
+                },
                 else => return error.Malformed,
             }
         }

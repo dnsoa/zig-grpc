@@ -19,8 +19,11 @@ pub const Metadata = struct {
 
     /// Looks up a binary (`-bin`) entry and base64-decodes it into `arena`.
     /// Accepts padded and unpadded values — the spec requires tolerating both.
+    /// A name without the `-bin` suffix is `error.NotBinaryMetadata`: this is a
+    /// library call taking a caller-supplied string, and an assert would abort
+    /// the process over it in every safe build.
     pub fn getBin(self: Metadata, arena: std.mem.Allocator, name: []const u8) !?[]u8 {
-        std.debug.assert(std.mem.endsWith(u8, name, "-bin"));
+        if (!std.mem.endsWith(u8, name, "-bin")) return error.NotBinaryMetadata;
         const v = self.get(name) orelse return null;
         // Manually remove trailing '=' padding
         var trimmed_len = v.len;
@@ -180,4 +183,13 @@ test "isValidValue accepts printable ASCII, rejects control bytes" {
     try testing.expect(!isValidValue("v\n"));
     try testing.expect(!isValidValue("v\x00"));
     try testing.expect(!isValidValue("hi\x7f"));
+}
+
+test "getBin rejects a non -bin name instead of asserting" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const md: Metadata = .{ .entries = &.{.{ .name = "k-bin", .value = "aGk=" }} };
+    // Previously std.debug.assert — an abort, in every safe build, over a
+    // caller-supplied string.
+    try testing.expectError(error.NotBinaryMetadata, md.getBin(arena_state.allocator(), "k"));
 }
