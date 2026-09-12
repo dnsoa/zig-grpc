@@ -18,12 +18,23 @@ pub const ServerCall = struct {
 pub const HandlerFn = *const fn (call: *ServerCall) anyerror!status_mod.Status;
 
 /// Full-method-path → handler table ("/pkg.Service/Method").
+///
+/// Owns its keys. Registration paths are routinely built rather than written
+/// out — formatted from a service name, read from generated code, held in an
+/// arena that is reset after setup — and a registry outliving them would then
+/// be hashing freed memory on every lookup.
 pub const Registry = struct {
     map: std.StringHashMapUnmanaged(HandlerFn) = .empty,
 
     pub fn register(self: *Registry, gpa: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
         const gop = try self.map.getOrPut(gpa, path);
         if (gop.found_existing) return error.DuplicateMethod;
+        // getOrPut stored the caller's slice as the key; swap in our own copy.
+        // Same bytes, so the hash is unchanged and the entry stays valid.
+        gop.key_ptr.* = gpa.dupe(u8, path) catch |err| {
+            _ = self.map.remove(path);
+            return err;
+        };
         gop.value_ptr.* = handler;
     }
 
@@ -32,6 +43,8 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry, gpa: std.mem.Allocator) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
         self.map.deinit(gpa);
     }
 };
@@ -50,4 +63,22 @@ test "registry registers, looks up, rejects duplicates" {
     try testing.expect(reg.lookup("/test.Svc/A") != null);
     try testing.expect(reg.lookup("/test.Svc/B") == null);
     try testing.expectError(error.DuplicateMethod, reg.register(testing.allocator, "/test.Svc/A", dummyHandler));
+}
+
+test "registry owns its keys (a caller's temporary path stays valid)" {
+    var reg: Registry = .{};
+    defer reg.deinit(testing.allocator);
+
+    // The shape that used to dangle: the path lives in an arena that is gone
+    // before the first lookup.
+    {
+        var tmp = std.heap.ArenaAllocator.init(testing.allocator);
+        defer tmp.deinit();
+        const path = try std.fmt.allocPrint(tmp.allocator(), "/{s}.Svc/{s}", .{ "pkg", "Method" });
+        try reg.register(testing.allocator, path, dummyHandler);
+    }
+
+    try testing.expect(reg.lookup("/pkg.Svc/Method") != null);
+    // Duplicate detection still works against the owned copy.
+    try testing.expectError(error.DuplicateMethod, reg.register(testing.allocator, "/pkg.Svc/Method", dummyHandler));
 }

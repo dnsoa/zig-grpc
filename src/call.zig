@@ -390,6 +390,12 @@ fn parseTrailerStatus(arena: std.mem.Allocator, hs: []const h2.hpack.Header, tra
     if (trailers_only) {
         const hsv = findHeader(hs, ":status") orelse "";
         const parsed = std.fmt.parseInt(u16, hsv, 10) catch 0;
+        // HTTP said OK, so nothing at the transport level went wrong — the
+        // response is simply malformed. `codeFromHttpStatus(200)` would call it
+        // `unknown`, which reads as "the peer reported a status we don't
+        // recognize" when in fact it reported none. Only a non-200 gets the
+        // HTTP mapping (a proxy answering instead of a gRPC server).
+        if (parsed == 200) return .{ .code = .internal, .message = "trailers-only response without grpc-status" };
         return .{ .code = status_mod.codeFromHttpStatus(parsed), .message = "missing grpc-status" };
     }
     return .{ .code = .internal, .message = "missing grpc-status in trailers" };
@@ -1138,4 +1144,31 @@ test "the per-event scratch arena is reused, not regrown, across a long stream" 
     const cap_at_end = call.ev_arena.queryCapacity();
     try testing.expect(cap_after_first > 0);
     try testing.expect(cap_at_end <= cap_after_first * 2);
+}
+
+test "trailers-only with HTTP 200 and no grpc-status is internal, not unknown" {
+    // `codeFromHttpStatus(200)` reads as "the peer reported a status we do not
+    // recognize"; in fact it reported none, which is a malformed response.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Single HEADERS + END_STREAM, 200, grpc content-type, but no grpc-status.
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, blk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
 }
