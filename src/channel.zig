@@ -15,6 +15,12 @@ pub const Channel = struct {
     opts: Options,
     owned: ?*OwnedConn = null,
     authority_owned: bool = false,
+    /// RawCalls handed out and not yet deinit'd. `deinit` checks this is zero:
+    /// `h2.Client.deinit` frees every `*h2.Stream`, so a call outliving its
+    /// channel holds a dangling pointer and its own `deinit` (`stream.close()`)
+    /// is a use-after-free. Nothing in this API makes that ordering visible, so
+    /// the check turns a silent heap corruption into an immediate, named abort.
+    live_calls: std.atomic.Value(u32) = .init(0),
 
     pub const Options = struct {
         authority: []const u8 = "",
@@ -26,6 +32,12 @@ pub const Channel = struct {
 
     /// `self` must stay at a stable address until `deinit` (the h2 client's
     /// reader thread holds pointers into it). Caller owns `r`/`w`.
+    ///
+    /// ⚠️ The caller must also **close the transport around `deinit`**. The h2
+    /// client's reader thread sits in a blocking read on `r`; `deinit` joins it,
+    /// and only EOF/error on the transport gets it out — so deinit'ing a channel
+    /// over a still-open connection hangs. `connectTcp` owns its socket and
+    /// handles this itself; `init` callers must do it.
     pub fn init(self: *Channel, io: Io, gpa: std.mem.Allocator, r: *Io.Reader, w: *Io.Writer, opts: Options) !void {
         self.* = .{ .io = io, .gpa = gpa, .h2c = undefined, .opts = opts };
         try self.h2c.init(io, gpa, r, w);
@@ -41,7 +53,19 @@ pub const Channel = struct {
         sw: Io.net.Stream.Writer = undefined,
     };
 
+    /// Releases the channel. Every `RawCall`/`Call` opened on it must be
+    /// deinit'd FIRST — see `live_calls`. For `init` channels the caller must
+    /// also close the transport around this call, or the reader-thread join
+    /// blocks forever.
     pub fn deinit(self: *Channel) void {
+        // A call still holding an h2 stream would be left dangling by
+        // h2c.deinit() below. Checked only where runtime safety is on: the cost
+        // is one atomic load, and in a release build we would rather leak the
+        // call's arena than add a new panic to a shutdown path.
+        if (std.debug.runtime_safety and self.live_calls.load(.acquire) != 0) {
+            @panic("zig-grpc: Channel.deinit() with live calls — deinit every RawCall/Call first " ++
+                "(h2.Client.deinit frees the streams they point at)");
+        }
         // 先 shutdown 自有传输（connectTcp 的 socket），让 h2 reader 线程阻塞的 I/O 读收到
         // 干净 EOF（而非 close 的 EBADF——后者在 io 后端会 panic "programmer bug"）、退出；
         // 否则下面 h2c.deinit 的 reader_thread.join 会挂（持久 HTTP/2 server 是常态——
@@ -103,6 +127,8 @@ pub const Channel = struct {
         }
         for (call_opts.metadata) |e| {
             if (metadata_mod.isReservedName(e.name)) return error.ReservedMetadataName;
+            if (!metadata_mod.isValidName(e.name)) return error.InvalidMetadataName;
+            if (!metadata_mod.isValidValue(e.value)) return error.InvalidMetadataValue;
             try headers.append(self.gpa, .{ .name = e.name, .value = e.value });
         }
         const s = try self.h2c.openStream(.{
@@ -275,4 +301,35 @@ test "connectTcp dials h2c and completes a call" {
     call.deinit();
     chan.deinit(); // close socket → server reads EOF → thread exits
     th.join();
+}
+
+test "metadata with control bytes is rejected before it reaches the wire" {
+    var cap: Captured = .{};
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, captureHandler, &cap, .{});
+    defer lb.stop();
+
+    try testing.expectError(error.InvalidMetadataValue, lb.chan.startRaw("/x", .{
+        .metadata = &.{.{ .name = "x-trace-id", .value = "ok\r\nx-injected: 1" }},
+    }));
+    try testing.expectError(error.InvalidMetadataName, lb.chan.startRaw("/x", .{
+        .metadata = &.{.{ .name = "bad name", .value = "v" }},
+    }));
+}
+
+test "live_calls tracks outstanding calls so deinit can refuse to strand one" {
+    var cap: Captured = .{};
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, captureHandler, &cap, .{});
+    defer lb.stop();
+
+    try testing.expectEqual(@as(u32, 0), lb.chan.live_calls.load(.acquire));
+    var a = try lb.chan.startRaw("/test.Svc/A", .{});
+    var b = try lb.chan.startRaw("/test.Svc/B", .{});
+    try testing.expectEqual(@as(u32, 2), lb.chan.live_calls.load(.acquire));
+    a.deinit();
+    try testing.expectEqual(@as(u32, 1), lb.chan.live_calls.load(.acquire));
+    b.deinit();
+    // Back to zero, so lb.stop()'s chan.deinit() passes its check.
+    try testing.expectEqual(@as(u32, 0), lb.chan.live_calls.load(.acquire));
 }

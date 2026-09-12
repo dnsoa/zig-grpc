@@ -46,6 +46,39 @@ pub fn isReservedName(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "user-agent");
 }
 
+/// Whether a metadata key is legal to put on the wire. The gRPC spec allows
+/// digits, lowercase letters, `_`, `-` and `.`; uppercase is accepted here
+/// because HPACK lowercases names on the way out (HTTP/2 field names must be
+/// lowercase), so `X-Trace-Id` and `x-trace-id` are the same header.
+///
+/// The point is to reject everything else — spaces, `:`, and above all CR/LF
+/// and NUL. HPACK is length-prefixed, so a stray CRLF cannot split a frame
+/// here, but a gateway translating the request down to HTTP/1.1 turns it into
+/// response splitting. Validating at the edge is what the other gRPC
+/// implementations do.
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or
+            (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            ch == '_' or ch == '-' or ch == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Whether a metadata value is legal to put on the wire: printable ASCII
+/// (0x20–0x7E), per the gRPC spec's `ASCII-Value`. Binary metadata travels
+/// base64-encoded under a `-bin` key, so it is printable too. Empty is allowed
+/// — the spec's grammar says otherwise but real implementations send it.
+pub fn isValidValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch < 0x20 or ch > 0x7e) return false;
+    }
+    return true;
+}
+
 /// Encodes a deadline as a `grpc-timeout` value: at most 8 digits plus a
 /// unit, smallest unit that fits, rounding up so a deadline never shortens.
 pub fn encodeTimeout(ns: u64, buf: *[9]u8) []const u8 {
@@ -123,4 +156,28 @@ test "encodeTimeout falls back to hours without trailing garbage" {
     try testing.expectEqualStrings("48H", encodeTimeout(48 * std.time.ns_per_hour, &buf));
     // Largest u64 ns is ~5.1M hours (8 digits) — still a clean slice, no tail.
     try testing.expectEqualStrings("5124096H", encodeTimeout(std.math.maxInt(u64), &buf));
+}
+
+test "isValidName accepts gRPC key characters, rejects the rest" {
+    try testing.expect(isValidName("x-trace-id"));
+    try testing.expect(isValidName("grpc.internal_key-1"));
+    // Uppercase is accepted: HPACK lowercases names on the way out.
+    try testing.expect(isValidName("X-Trace-Id"));
+    try testing.expect(!isValidName(""));
+    try testing.expect(!isValidName("has space"));
+    try testing.expect(!isValidName("colon:name"));
+    try testing.expect(!isValidName("crlf\r\nname"));
+    try testing.expect(!isValidName("nul\x00name"));
+}
+
+test "isValidValue accepts printable ASCII, rejects control bytes" {
+    try testing.expect(isValidValue("plain value 123"));
+    try testing.expect(isValidValue("")); // empty is tolerated
+    try testing.expect(isValidValue("aGk=")); // base64 for -bin keys
+    // The ones that matter: a gateway downgrading to HTTP/1.1 would turn these
+    // into response splitting.
+    try testing.expect(!isValidValue("v\r\nX-Injected: 1"));
+    try testing.expect(!isValidValue("v\n"));
+    try testing.expect(!isValidValue("v\x00"));
+    try testing.expect(!isValidValue("hi\x7f"));
 }
