@@ -66,6 +66,48 @@ pub fn codeFromH2Error(code: u32) Code {
     };
 }
 
+/// Maps a transport-level Zig error — the kind `Channel.startRaw`/`send`/
+/// `recvMessage` surface when the RPC never got far enough to carry a real
+/// `grpc-status` — onto a gRPC code.
+///
+/// The point is retryability. A caller's first question about a failed RPC is
+/// whether retrying is safe, and that answer is a code, not an error name:
+/// `GoingAway`/`ConnectionClosed`/`StreamIdsExhausted` all mean "this
+/// connection is done, a fresh one will work" (`unavailable`), while
+/// `HeadersTooLarge` means the request itself will never fit.
+///
+/// Only for errors with no status of their own — a `RawCall` that already
+/// mapped one (via `codeFromH2Error`, `codeFromHttpStatus`, or the trailers)
+/// carries the better answer, so prefer `stat` when it is set.
+pub fn codeFromTransportError(err: anyerror) Code {
+    return switch (err) {
+        // The connection is going away or gone; a new one is safe to retry on.
+        error.ConnectionClosed, error.GoingAway, error.StreamIdsExhausted => .unavailable,
+        // Deliberately NOT `unavailable`. zig-http2's send path returns
+        // StreamReset for two different things: a peer RST (whose error code
+        // never reaches us here) and a local `cancel()` — `abortLocal` sets the
+        // same `aborted` flag the reader surfaces as StreamCancelled. Telling a
+        // caller to retry on a fresh connection would be wrong for the cancel
+        // case and a guess for the RST case, where REFUSED_STREAM, CANCEL and
+        // INTERNAL_ERROR all collapse into this one error. Whenever the reader
+        // actually saw the RST, `RawCall.stat` has the real code via
+        // `codeFromH2Error`, and `recordFailure` prefers it over this fallback.
+        error.StreamReset => .unknown,
+        error.StreamCancelled => .cancelled,
+        error.DeadlineExceeded => .deadline_exceeded,
+        // Too big to ever send/receive — retrying unchanged will not help.
+        error.MessageTooLarge, error.HeadersTooLarge => .resource_exhausted,
+        error.OutOfMemory => .resource_exhausted,
+        // Caller-supplied metadata we refused before it reached the wire.
+        error.ReservedMetadataName,
+        error.InvalidMetadataName,
+        error.InvalidMetadataValue,
+        => .invalid_argument,
+        error.CompressedUnsupported, error.MalformedFrame => .internal,
+        else => .unknown,
+    };
+}
+
 /// Percent-decodes a `grpc-message` value. Invalid escapes pass through
 /// verbatim — the spec forbids failing on them.
 pub fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -137,4 +179,19 @@ test "percentDecode handles valid, invalid, and plain strings" {
     try testing.expectEqualStrings("bad%zz", try percentDecode(arena, "bad%zz"));
     try testing.expectEqualStrings("tail%2", try percentDecode(arena, "tail%2"));
     try testing.expectEqualStrings("\xe4\xb8\xad", try percentDecode(arena, "%E4%B8%AD"));
+}
+
+test "codeFromTransportError separates retryable from terminal" {
+    // The whole point: these three mean "this connection is done, a fresh one
+    // will work", which a caller can only act on as a code.
+    try testing.expectEqual(Code.unavailable, codeFromTransportError(error.ConnectionClosed));
+    try testing.expectEqual(Code.unavailable, codeFromTransportError(error.GoingAway));
+    try testing.expectEqual(Code.unavailable, codeFromTransportError(error.StreamIdsExhausted));
+    // These will not get better on retry.
+    try testing.expectEqual(Code.resource_exhausted, codeFromTransportError(error.HeadersTooLarge));
+    try testing.expectEqual(Code.resource_exhausted, codeFromTransportError(error.MessageTooLarge));
+    try testing.expectEqual(Code.invalid_argument, codeFromTransportError(error.InvalidMetadataValue));
+    try testing.expectEqual(Code.cancelled, codeFromTransportError(error.StreamCancelled));
+    try testing.expectEqual(Code.deadline_exceeded, codeFromTransportError(error.DeadlineExceeded));
+    try testing.expectEqual(Code.unknown, codeFromTransportError(error.SomethingNobodyMapped));
 }
