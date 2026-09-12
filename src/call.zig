@@ -34,6 +34,16 @@ pub const RawCall = struct {
     assembler: frame.Assembler,
     /// Owns response headers/trailers/status message until `deinit`.
     arena_state: std.heap.ArenaAllocator,
+    /// Scratch for ONE inbound event, reused across `step()` calls: readEvent
+    /// decodes the header list / copies the DATA payload in here, and by the
+    /// time `step()` returns everything worth keeping has been copied out —
+    /// headers and status into `arena_state`, body bytes into the assembler —
+    /// so the next `step()` can reset it.
+    ///
+    /// It used to be a fresh `ArenaAllocator` per event, i.e. a malloc/free
+    /// pair on every single inbound frame. `finish()` already reused one arena
+    /// across its drain loop; this is the same trick on the hot path.
+    ev_arena: std.heap.ArenaAllocator,
     state: State = .awaiting_headers,
     resp_headers: ?Metadata = null,
     resp_trailers: Metadata = .{},
@@ -69,6 +79,7 @@ pub const RawCall = struct {
             .stream = stream,
             .assembler = frame.Assembler.init(chan.gpa, chan.opts.max_recv_message_size),
             .arena_state = std.heap.ArenaAllocator.init(chan.gpa),
+            .ev_arena = std.heap.ArenaAllocator.init(chan.gpa),
         };
     }
 
@@ -108,6 +119,7 @@ pub const RawCall = struct {
         self.stream.close();
         self.assembler.deinit();
         self.arena_state.deinit();
+        self.ev_arena.deinit();
         _ = self.chan.live_calls.fetchSub(1, .monotonic);
     }
 
@@ -219,9 +231,11 @@ pub const RawCall = struct {
         // `swap` so the wakeup fires once, on the transition — broadcasting on
         // every later event would be pure overhead on the hot path.
         defer if (self.state != .awaiting_headers and !self.head_settled.swap(true, .release)) self.wakeHeadWaiters();
-        var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
-        defer scratch.deinit();
-        const ev = self.stream.readEvent(scratch.allocator()) catch |e| switch (e) {
+        // Reuse the per-call scratch. Safe because nothing from the previous
+        // event outlives its `step()`: onHeaders dupes into `arena_state` and
+        // the DATA arm copies into the assembler before returning.
+        _ = self.ev_arena.reset(.retain_capacity);
+        const ev = self.stream.readEvent(self.ev_arena.allocator()) catch |e| switch (e) {
             error.EndOfStream => {
                 if (self.stat == null) self.stat = .{ .code = .internal, .message = "stream ended without grpc-status" };
                 self.state = .done;
@@ -1079,4 +1093,49 @@ test "header() drives the receive path itself when no receiver is running" {
 
     const md = try call.header();
     try testing.expectEqualStrings("application/grpc", md.get("content-type").?);
+}
+
+fn manyMessagesHandler(ctx: *h2.Context) anyerror!void {
+    var buf: [64]u8 = undefined;
+    _ = try readAllBody(ctx, &buf);
+    ctx.res.status(200);
+    try ctx.res.header("content-type", "application/grpc");
+    var i: usize = 0;
+    while (i < 200) : (i += 1) try writeMsgFrames(ctx.res, "0123456789abcdef");
+    try ctx.res.trailer("grpc-status", "0");
+    try ctx.res.finish();
+}
+
+test "the per-event scratch arena is reused, not regrown, across a long stream" {
+    // Guards the reuse: without the `reset(.retain_capacity)` the arena would
+    // keep every event's bytes and its capacity would climb with the message
+    // count; with a fresh arena per event the field would not exist at all.
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, manyMessagesHandler, null, .{});
+    defer lb.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var call = try lb.chan.startRaw("/test.Svc/Many", .{});
+    defer call.deinit();
+    try call.sendMessage("go");
+    try call.closeSend();
+
+    var seen: usize = 0;
+    var cap_after_first: usize = 0;
+    while (try call.recvMessage(arena)) |m| {
+        try testing.expectEqualStrings("0123456789abcdef", m);
+        seen += 1;
+        if (seen == 1) cap_after_first = call.ev_arena.queryCapacity();
+        _ = arena_state.reset(.retain_capacity);
+    }
+    try testing.expectEqual(@as(usize, 200), seen);
+    try testing.expect((try call.finish()).isOk());
+
+    // 200 messages later the scratch is still the size one event needs.
+    const cap_at_end = call.ev_arena.queryCapacity();
+    try testing.expect(cap_after_first > 0);
+    try testing.expect(cap_at_end <= cap_after_first * 2);
 }
