@@ -83,8 +83,16 @@ pub fn codeFromTransportError(err: anyerror) Code {
     return switch (err) {
         // The connection is going away or gone; a new one is safe to retry on.
         error.ConnectionClosed, error.GoingAway, error.StreamIdsExhausted => .unavailable,
-        // The peer tore down just this stream.
-        error.StreamReset => .unavailable,
+        // Deliberately NOT `unavailable`. zig-http2's send path returns
+        // StreamReset for two different things: a peer RST (whose error code
+        // never reaches us here) and a local `cancel()` — `abortLocal` sets the
+        // same `aborted` flag the reader surfaces as StreamCancelled. Telling a
+        // caller to retry on a fresh connection would be wrong for the cancel
+        // case and a guess for the RST case, where REFUSED_STREAM, CANCEL and
+        // INTERNAL_ERROR all collapse into this one error. Whenever the reader
+        // actually saw the RST, `RawCall.stat` has the real code via
+        // `codeFromH2Error`, and `recordFailure` prefers it over this fallback.
+        error.StreamReset => .unknown,
         error.StreamCancelled => .cancelled,
         error.DeadlineExceeded => .deadline_exceeded,
         // Too big to ever send/receive — retrying unchanged will not help.

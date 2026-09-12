@@ -161,7 +161,7 @@ pub const Channel = struct {
     ) !@TypeOf(M).Res {
         var c = self.start(M, call_opts) catch |e| {
             // No call exists yet, so there is no RawCall.stat to prefer.
-            writeStatus(call_opts, arena, .{
+            writeStatusBestEffort(call_opts, arena, .{
                 .code = status_mod.codeFromTransportError(e),
                 .message = @errorName(e),
             });
@@ -186,11 +186,11 @@ pub const Channel = struct {
             return e;
         };
 
-        writeStatus(call_opts, arena, st);
+        try writeStatus(call_opts, arena, st);
         if (!st.isOk()) return error.RpcFailed;
         if (res == null) {
             // OK trailers but no message: the server broke the unary contract.
-            writeStatus(call_opts, arena, .{
+            writeStatusBestEffort(call_opts, arena, .{
                 .code = .internal,
                 .message = "server ended the call without a response message",
             });
@@ -202,7 +202,18 @@ pub const Channel = struct {
 
 /// Copies `st` into `call_opts.status_out`, duping the message into `arena` —
 /// a status read off the call points into the call's arena, which dies with it.
-fn writeStatus(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, st: call_mod.Status) void {
+/// Used where the RPC otherwise succeeded, so an allocator failure is reported
+/// rather than silently producing a status with no message.
+fn writeStatus(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, st: call_mod.Status) !void {
+    const out = call_opts.status_out orelse return;
+    out.* = .{ .code = st.code, .message = try arena.dupe(u8, st.message) };
+}
+
+/// Same, for paths already returning an error. Propagating an allocator failure
+/// here would replace the real reason the call failed, but `status_out` may be
+/// uninitialized (callers pass `var st: Status = undefined`), so the code must
+/// still be written — only the message degrades to empty.
+fn writeStatusBestEffort(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, st: call_mod.Status) void {
     const out = call_opts.status_out orelse return;
     out.* = .{ .code = st.code, .message = arena.dupe(u8, st.message) catch "" };
 }
@@ -211,7 +222,7 @@ fn writeStatus(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, st: ca
 /// (it saw the RST code / HTTP status / trailers); the raw error is only a
 /// fallback for failures that never reached a status.
 fn recordFailure(raw: *const call_mod.RawCall, call_opts: call_mod.CallOptions, arena: std.mem.Allocator, err: anyerror) void {
-    writeStatus(call_opts, arena, raw.stat orelse .{
+    writeStatusBestEffort(call_opts, arena, raw.stat orelse .{
         .code = status_mod.codeFromTransportError(err),
         .message = @errorName(err),
     });

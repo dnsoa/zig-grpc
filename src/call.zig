@@ -50,6 +50,13 @@ pub const RawCall = struct {
     /// decoded, or the stream ended some other way. Lets `header()` answer
     /// without taking `recv_mu`; see the fast path there.
     head_settled: std.atomic.Value(bool) = .init(false),
+    /// Waited on by a `header()` that found another thread already driving the
+    /// receive path. It must NOT wait on `recv_mu`: a receiver keeps that lock
+    /// across a blocking `readEvent`, so once it has consumed the HEADERS it
+    /// goes straight back to waiting for the next message, still holding it —
+    /// and `header()` would be stuck behind a value that already arrived.
+    head_mu: Io.Mutex = .init,
+    head_cond: Io.Condition = .init,
 
     const State = enum { awaiting_headers, open, done };
 
@@ -147,16 +154,40 @@ pub const RawCall = struct {
     /// The returned Metadata is owned by the call (valid until deinit).
     /// Safe to call from a thread other than the one in `recvMessage`.
     pub fn header(self: *RawCall) !Metadata {
-        // Fast path: once the head phase has settled, `resp_headers` is frozen
-        // (later HEADERS land in `resp_trailers`), so answer without the lock.
-        // Taking it here would block behind a receiver parked in readEvent
-        // waiting for the *next* message — on a server-streaming call that can
-        // be an unbounded wait for a value we already have.
-        if (self.head_settled.load(.acquire)) return self.resp_headers orelse .{};
-        self.recv_mu.lockUncancelable(self.chan.io);
-        defer self.recv_mu.unlock(self.chan.io);
-        while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
-        return self.resp_headers orelse .{};
+        while (true) {
+            // Already settled: `resp_headers` is frozen (later HEADERS land in
+            // `resp_trailers`), so answer without touching a lock.
+            if (self.head_settled.load(.acquire)) return self.resp_headers orelse .{};
+
+            // Nobody is driving the receive path — drive it ourselves, far
+            // enough to get the head phase decided.
+            if (self.recv_mu.tryLock()) {
+                defer self.recv_mu.unlock(self.chan.io);
+                // Release any waiters even when we leave by error: an
+                // unclassified transport error can return with `state` still
+                // `.awaiting_headers`, in which case step()'s own wakeup does
+                // not fire and they would wait forever. They re-check and take
+                // over from the top of the loop.
+                defer self.wakeHeadWaiters();
+                while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
+                return self.resp_headers orelse .{};
+            }
+
+            // Someone else is driving. Wait for the head phase to be *decided*,
+            // not for the lock they are holding.
+            self.head_mu.lockUncancelable(self.chan.io);
+            if (!self.head_settled.load(.acquire)) self.head_cond.waitUncancelable(self.chan.io, &self.head_mu);
+            self.head_mu.unlock(self.chan.io);
+            // Loop: either it settled, or the driver bailed and we take over.
+        }
+    }
+
+    /// Wakes threads parked in `header()`. Takes `head_mu` so a wakeup cannot
+    /// slip between a waiter's `head_settled` re-check and its `wait`.
+    fn wakeHeadWaiters(self: *RawCall) void {
+        self.head_mu.lockUncancelable(self.chan.io);
+        self.head_cond.broadcast(self.chan.io);
+        self.head_mu.unlock(self.chan.io);
     }
 
     /// Drains any remaining messages, then returns the final status. Intended
@@ -185,7 +216,9 @@ pub const RawCall = struct {
         // Publish the head-phase verdict on every exit path (including the
         // error ones). Release pairs with header()'s acquire, so a reader that
         // sees the flag also sees the `resp_headers`/`state` writes behind it.
-        defer if (self.state != .awaiting_headers) self.head_settled.store(true, .release);
+        // `swap` so the wakeup fires once, on the transition — broadcasting on
+        // every later event would be pure overhead on the hot path.
+        defer if (self.state != .awaiting_headers and !self.head_settled.swap(true, .release)) self.wakeHeadWaiters();
         var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
         defer scratch.deinit();
         const ev = self.stream.readEvent(scratch.allocator()) catch |e| switch (e) {
@@ -963,4 +996,87 @@ test "header() answers while another thread is parked in recvMessage" {
     try testing.expect(header_returned);
     try testing.expect(recv_still_parked);
     try testing.expect(racer.saw_content_type);
+}
+
+test "header() started before HEADERS is not stuck behind a parked receiver" {
+    // The slow path, which the fast-path test above does not reach: both
+    // threads start while the head phase is still undecided, so header() finds
+    // head_settled == false AND the receiver already holding recv_mu. Waiting
+    // on the mutex would mean waiting for the first message (or the end of the
+    // stream), because the receiver reacquires nothing — it never lets go.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Receiver first, with nothing to consume yet: it takes recv_mu and parks.
+    var recv: BlockedRecv = .{ .call = &call };
+    const th_recv = try std.Thread.spawn(.{}, BlockedRecv.run, .{&recv});
+    std.Io.sleep(testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+
+    // header() now enters with the head phase undecided and the lock taken.
+    var racer: HeaderRacer = .{ .call = &call };
+    const th_hdr = try std.Thread.spawn(.{}, HeaderRacer.run, .{&racer});
+    std.Io.sleep(testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+
+    // Only now do the headers arrive. The receiver consumes them and goes
+    // straight back to waiting for DATA, still holding recv_mu.
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    var header_returned = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (racer.done.load(.acquire)) {
+            header_returned = true;
+            break;
+        }
+        std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    const recv_still_parked = !recv.done.load(.acquire);
+
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+    th_recv.join();
+    th_hdr.join();
+
+    try testing.expect(header_returned);
+    try testing.expect(recv_still_parked);
+    try testing.expect(racer.saw_content_type);
+}
+
+test "header() drives the receive path itself when no receiver is running" {
+    // The other half of the slow path: nobody holds recv_mu, so header() must
+    // take it and step() until the headers land — otherwise waiting on
+    // head_cond would hang, since nothing else would ever decide the phase.
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    const md = try call.header();
+    try testing.expectEqualStrings("application/grpc", md.get("content-type").?);
 }
