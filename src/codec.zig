@@ -21,9 +21,9 @@ pub fn Method(comptime RequestT: type, comptime ResponseT: type) type {
 fn encodesViaWriter(comptime T: type) bool {
     const info = @typeInfo(@TypeOf(@field(T, "encode")));
     if (info != .@"fn") return false;
-    const params = info.@"fn".params;
+    const params = info.@"fn".param_types;
     if (params.len >= 2) {
-        if (params[1].type) |pt| return pt == *std.Io.Writer;
+        if (params[1]) |pt| return pt == *std.Io.Writer;
     }
     return false;
 }
@@ -33,9 +33,9 @@ fn encodesViaWriter(comptime T: type) bool {
 fn decodesViaReader(comptime T: type) bool {
     const info = @typeInfo(@TypeOf(@field(T, "decode")));
     if (info != .@"fn") return false;
-    const params = info.@"fn".params;
+    const params = info.@"fn".param_types;
     if (params.len >= 1) {
-        if (params[0].type) |pt| return pt == *std.Io.Reader;
+        if (params[0]) |pt| return pt == *std.Io.Reader;
     }
     return false;
 }
