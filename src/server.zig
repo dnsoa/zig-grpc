@@ -1,7 +1,7 @@
 //! Server-side shapes. v1 pins down the shared types and the service
 //! registry so client and server agree on Status/Metadata/HandlerFn; the
 //! connection-serving path (bridging h2.serveConn) lands in the server
-//! phase — see the design spec.
+//! phase.
 
 const std = @import("std");
 const status_mod = @import("status.zig");

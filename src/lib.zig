@@ -37,9 +37,3 @@ test {
     _ = call_mod;
     _ = channel_mod;
 }
-
-test "scaffold compiles" {
-    const h2 = @import("zig_http2");
-    _ = h2;
-    try std.testing.expect(true);
-}

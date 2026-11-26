@@ -33,12 +33,16 @@ pub const Status = struct {
     }
 };
 
-/// Parses a `grpc-status` trailer value. Unparseable or out-of-range values
-/// become `unknown` — the caller cannot do better.
+/// Parses a `grpc-status` trailer value (`1*DIGIT`). Unparseable or
+/// out-of-range values become `unknown` — the caller cannot do better.
 pub fn codeFromGrpcStatus(value: []const u8) Code {
-    const n = std.fmt.parseInt(u8, value, 10) catch return .unknown;
+    if (value.len == 0) return .unknown;
+    for (value) |ch| {
+        if (!std.ascii.isDigit(ch)) return .unknown;
+    }
+    const n = std.fmt.parseUnsigned(u8, value, 10) catch return .unknown;
     if (n > 16) return .unknown;
-    return @fromBackingInt(@intCast(n));
+    return @fromBackingInt(n);
 }
 
 /// gRPC spec mapping for a non-200 `:status` when the response carries no
@@ -145,6 +149,10 @@ test "codeFromGrpcStatus parses valid, falls back to unknown" {
     try testing.expectEqual(Code.unknown, codeFromGrpcStatus("17"));
     try testing.expectEqual(Code.unknown, codeFromGrpcStatus("abc"));
     try testing.expectEqual(Code.unknown, codeFromGrpcStatus(""));
+    try testing.expectEqual(Code.unknown, codeFromGrpcStatus("+0"));
+    try testing.expectEqual(Code.unknown, codeFromGrpcStatus("-1"));
+    try testing.expectEqual(Code.unknown, codeFromGrpcStatus("1_2"));
+    try testing.expectEqual(Code.unknown, codeFromGrpcStatus(" 0"));
 }
 
 test "codeFromHttpStatus follows the spec table" {

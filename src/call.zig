@@ -1,5 +1,5 @@
 //! Per-call state. RawCall drives one h2 stream through the gRPC call
-//! lifecycle; Call(M) (Task 9) is the typed wrapper on top.
+//! lifecycle; Call(M) is the typed wrapper on top.
 
 const std = @import("std");
 const h2 = @import("zig_http2");
@@ -224,7 +224,19 @@ pub const RawCall = struct {
         var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
         defer scratch.deinit();
         while (self.state != .done) {
-            _ = self.recvLocked(scratch.allocator()) catch break;
+            _ = self.recvLocked(scratch.allocator()) catch |e| {
+                if (self.stat == null) {
+                    self.stat = .{
+                        .code = status_mod.codeFromTransportError(e),
+                        .message = @errorName(e),
+                    };
+                }
+                if (self.state != .done) {
+                    self.abandon();
+                    if (!self.head_settled.swap(true, .release)) self.wakeHeadWaiters();
+                }
+                break;
+            };
             _ = scratch.reset(.retain_capacity);
         }
         return self.stat orelse .{ .code = .internal, .message = "call ended without status" };
@@ -486,7 +498,7 @@ pub fn Call(comptime M: anytype) type {
     };
 }
 
-// ---- Task 7: receive state machine tests ----
+// ---- receive state machine tests ----
 
 // Hand-write gRPC message frames (server side). Prefix and payload go in two
 // separate writes — each write is an independent DATA frame, which also
@@ -611,7 +623,7 @@ test "non-OK status with percent-decoded message" {
     try testing.expectEqualStrings("no such thing", st.message);
 }
 
-// ---- Task 8: abnormal-path tests (raw-frame peer) ----
+// ---- abnormal-path tests (raw-frame peer) ----
 
 test "RST_STREAM(CANCEL) maps to cancelled status" {
     var rp: testutil.RawPeer = undefined;
@@ -791,7 +803,7 @@ test "cancel() from another thread unblocks recvMessage with cancelled status" {
     try testing.expectEqual(status_mod.Code.cancelled, (try call.finish()).code);
 }
 
-// ---- Task 9: typed Call(M) / start / unary tests ----
+// ---- typed Call(M) / start / unary tests ----
 
 const codec_mod = @import("codec.zig");
 const TestMsg = struct {
@@ -1410,4 +1422,39 @@ test "recvMessage maps caller arena OutOfMemory to resource_exhausted (#10)" {
     var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, call.recvMessage(fail.allocator()));
     try testing.expectEqual(status_mod.Code.resource_exhausted, (try call.finish()).code);
+}
+
+test "finish() maps step() OutOfMemory to resource_exhausted and settles the call" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/FinishOom", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Force `onHeaders` -> `dupEntries` inside `step()` to fail with OOM.
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    call.arena_state.deinit();
+    call.arena_state = std.heap.ArenaAllocator.init(fail.allocator());
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try blk.literal(testing.allocator, "x-k", "v");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    const st = try call.finish();
+    try testing.expectEqual(status_mod.Code.resource_exhausted, st.code);
+    try testing.expectEqual(RawCall.State.done, call.state);
+    try testing.expect(call.head_settled.load(.acquire));
+    // Re-calling finish() returns the settled status without blocking.
+    try testing.expectEqual(status_mod.Code.resource_exhausted, (try call.finish()).code);
+    // Peer receives RST_STREAM from abandon().
+    const rst = try rp.readUntil(.rst_stream);
+    testing.allocator.free(rst.payload);
 }

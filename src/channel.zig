@@ -1,6 +1,6 @@
 //! Channel: one HTTP/2 connection multiplexing concurrent gRPC calls.
 //! Transport-agnostic core (`init` over any reader/writer); `connectTcp`
-//! (Task 10) adds the h2c dial convenience.
+//! adds the h2c dial convenience.
 
 const std = @import("std");
 const h2 = @import("zig_http2");
@@ -210,30 +210,34 @@ pub const Channel = struct {
             recordFailure(&c.raw, call_opts, arena, e);
             return e;
         };
-        // A unary response is exactly one message. Reading again both catches a
-        // server that sent more and advances to the trailers, which `finish`
-        // needs anyway — so this costs no extra round trip on a well-behaved
-        // response, where it just returns null.
-        const extra = c.recv(arena) catch |e| {
-            recordFailure(&c.raw, call_opts, arena, e);
-            return e;
-        };
+        // A unary response is at most one message. When one arrived, probe once
+        // more at the frame level (skipping decode of an illegal extra message):
+        // on a well-behaved response this consumes trailers and returns null
+        // with no extra round trip; if a second message arrives, bail before
+        // `finish()` so `defer c.deinit()` resets the stream instead of hanging
+        // to drain an unbounded server stream.
+        if (res != null) {
+            const extra = c.raw.recvMessage(arena) catch |e| {
+                recordFailure(&c.raw, call_opts, arena, e);
+                return e;
+            };
+            if (extra != null) {
+                writeStatusBestEffort(call_opts, arena, .{
+                    .code = .internal,
+                    .message = "unary response carried more than one message",
+                });
+                return error.TooManyResponses;
+            }
+        }
         const st = c.finish() catch |e| {
             recordFailure(&c.raw, call_opts, arena, e);
             return e;
         };
 
-        if (extra != null) {
-            // Takes priority over the trailers' status: whatever the server
-            // meant to report, the response stream itself is malformed.
-            writeStatusBestEffort(call_opts, arena, .{
-                .code = .internal,
-                .message = "unary response carried more than one message",
-            });
-            return error.TooManyResponses;
+        if (!st.isOk()) {
+            writeStatusBestEffort(call_opts, arena, st);
+            return error.RpcFailed;
         }
-        try writeStatus(call_opts, arena, st);
-        if (!st.isOk()) return error.RpcFailed;
         if (res == null) {
             // OK trailers but no message: the server broke the unary contract.
             writeStatusBestEffort(call_opts, arena, .{
@@ -242,6 +246,7 @@ pub const Channel = struct {
             });
             return error.MissingResponse;
         }
+        try writeStatus(call_opts, arena, st);
         return res.?;
     }
 };
@@ -329,7 +334,7 @@ test "startRaw sends gRPC request headers and framed messages" {
     });
     try call.sendMessage("hi");
     try call.closeSend();
-    // Wait for the handler to finish (send path has no recv API until Task 7).
+    // Wait for the handler to finish recording the captured request fields.
     while (!cap.ok.load(.acquire)) {
         std.Io.sleep(testing.io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
     }
@@ -357,7 +362,7 @@ test "reserved metadata names are rejected" {
     }));
 }
 
-// ---- Task 10: connectTcp test ----
+// ---- connectTcp tests ----
 
 fn tcpOkHandler(ctx: *h2.Context) anyerror!void {
     if (ctx.body_reader) |br| {
@@ -737,4 +742,78 @@ test "unary surfaces server Trailers-Only status when early rejection resets sen
     try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
     try testing.expectEqual(status_mod.Code.unauthenticated, runner.code);
     try testing.expectEqualStrings("bad token", runner.msg_buf[0..runner.msg_len]);
+}
+
+test "unary returns TooManyResponses immediately without waiting for trailers" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var runner: UnaryRunner = .{ .chan = &rp.chan };
+    const th = try std.Thread.spawn(.{}, UnaryRunner.run, .{&runner});
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Send initial HEADERS + two messages and NEVER send trailers.
+    // unary() must fail fast with TooManyResponses and emit RST_STREAM(CANCEL)
+    // instead of hanging in finish() waiting for the stream to end.
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+    const two_msgs = [_]u8{ 0, 0, 0, 0, 2 } ++ "aa".* ++ [_]u8{ 0, 0, 0, 0, 2 } ++ "bb".*;
+    try rp.writeFrame(.data, 0, sid, &two_msgs);
+
+    // Wait for the RST_STREAM emitted when unary() bails out and deinit()s the call.
+    const rst = try rp.readUntil(.rst_stream);
+    testing.allocator.free(rst.payload);
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, error.TooManyResponses), runner.err);
+    try testing.expectEqual(status_mod.Code.internal, runner.code);
+}
+
+test "unary preserves status_out.code and RpcFailed when arena OOMs on non-OK status" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    const OomRunner = struct {
+        chan: *Channel,
+        err: ?anyerror = null,
+        st: status_mod.Status = .{ .code = .ok, .message = "untouched" },
+
+        fn run(self: *@This()) void {
+            var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+            if (self.chan.unary(
+                UnaryM,
+                fail.allocator(),
+                .{ .text = "x" },
+                .{ .status_out = &self.st },
+            )) |_| {} else |e| {
+                self.err = e;
+            }
+        }
+    };
+
+    var runner: OomRunner = .{ .chan = &rp.chan };
+    const th = try std.Thread.spawn(.{}, OomRunner.run, .{&runner});
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try blk.literal(testing.allocator, "grpc-status", "5");
+    try blk.literal(testing.allocator, "grpc-message", "missing");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, blk.buf.items);
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
+    try testing.expectEqual(status_mod.Code.not_found, runner.st.code);
+    try testing.expectEqualStrings("", runner.st.message);
 }

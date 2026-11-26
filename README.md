@@ -14,15 +14,31 @@ method registry); the connection-serving path is later work.
 - Single dependency: [`zig_http2`](https://github.com/dnsoa/zig-http2), v0.2.0, pinned by tag + hash in `build.zig.zon`
 - Plaintext h2c only (TLS is the caller's job — wrap your own reader/writer)
 
+## Install
+
+Fetch `zig-grpc` into `build.zig.zon`:
+
+```sh
+zig fetch --save https://github.com/dnsoa/zig-grpc/archive/refs/tags/v0.1.0.tar.gz
+```
+
+Then wire the `zig_grpc` module in `build.zig`:
+
+```zig
+const grpc_dep = b.dependency("zig_grpc", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("zig_grpc", grpc_dep.module("zig_grpc"));
+```
+
 ## Quickstart
 
 ```zig
 const std = @import("std");
 const grpc = @import("zig_grpc");
 
-// Your message: anything with `encode(self, gpa) ![]u8` and
-// `decode(arena, bytes) !T` (zig-protobuf messages fit; here it's hand-rolled
-// for the Echo proto's `string message = 1`).
+// Your message: anything with `encode(self, gpa) ![]u8` + `decode(arena, bytes) !T`
+// or zig-protobuf's `Io` signatures (`encode(self, *std.Io.Writer, gpa)` /
+// `decode(*std.Io.Reader, arena)`). Types without built-in decls can override
+// `encode_req`/`decode_res` on `grpc.Method`.
 const HelloMsg = struct {
     message: []const u8 = "",
 
@@ -42,14 +58,23 @@ const HelloMsg = struct {
         var i: usize = 0;
         while (i < bytes.len) {
             const tag = try readVarint(bytes, &i);
-            if (tag >> 3 == 1 and @as(u3, @truncate(tag)) == 2) {
-                const len = try readVarint(bytes, &i);
-                msg.message = try arena.dupe(u8, bytes[i..][0..len]);
-                i += len;
-            } else switch (@as(u3, @truncate(tag))) {
+            const field = tag >> 3;
+            switch (@as(u3, @truncate(tag))) {
+                2 => {
+                    const len = try readVarint(bytes, &i);
+                    if (len > bytes.len - i) return error.Malformed;
+                    if (field == 1) msg.message = try arena.dupe(u8, bytes[i..][0..len]);
+                    i += len;
+                },
                 0 => _ = try readVarint(bytes, &i),
-                5 => i += 4,
-                1 => i += 8,
+                5 => {
+                    if (bytes.len - i < 4) return error.Malformed;
+                    i += 4;
+                },
+                1 => {
+                    if (bytes.len - i < 8) return error.Malformed;
+                    i += 8;
+                },
                 else => return error.Malformed,
             }
         }
@@ -103,7 +128,8 @@ pointer for `unary`.
 ## Threading model & v1 limits
 
 - One **sender** thread and one **receiver** thread per call (inherited from
-  `h2.Stream`). `deinit` must not race a concurrent `send`/`recv`.
+  `h2.Stream`). `deinit` must not race a concurrent `send`/`recv`, and every
+  `Call`/`RawCall` must be `deinit`'d before its owning `Channel.deinit()`.
 - `cancel()` is thread-safe and **does** interrupt a `recv` blocked on another
   thread (it sends RST_STREAM and locally wakes the blocked read). That makes a
   client-side deadline implementable with a watchdog thread that calls
@@ -112,9 +138,10 @@ pointer for `unary`.
   message surfaces as an error.
 - **No connection pool / reconnect / load balancing** — a `Channel` is one
   HTTP/2 connection.
-- **TLS:** not built in. `Channel.init` takes any `*std.Io.Reader` /
-  `*std.Io.Writer`, so wrap a TLS stream yourself; `connectTcp` is the plaintext
-  h2c convenience.
+- **TLS & custom transports:** not built in. `Channel.init` takes any
+  `*std.Io.Reader` / `*std.Io.Writer` with a non-empty `opts.authority`, and
+  the caller must close the transport around `Channel.deinit()`. `connectTcp`
+  is the plaintext h2c convenience that owns its socket and derives `:authority`.
 
 ## Go interop
 

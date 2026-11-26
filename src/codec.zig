@@ -178,3 +178,28 @@ test "Method compiles for raw slices and plain structs without encode/decode dec
     const res = try M.decode_res(arena_state.allocator(), wire);
     try testing.expectEqual(@as(u32, 42), res.code);
 }
+
+const ProtoIoMsg = struct {
+    text: []const u8 = "",
+
+    pub fn encode(self: ProtoIoMsg, writer: *std.Io.Writer, _: std.mem.Allocator) !void {
+        try writer.writeAll(self.text);
+    }
+
+    pub fn decode(reader: *std.Io.Reader, arena: std.mem.Allocator) !ProtoIoMsg {
+        const bytes = try reader.allocRemaining(arena, .unlimited);
+        return .{ .text = bytes };
+    }
+};
+
+test "default codec supports zig-protobuf Io Writer/Reader signatures" {
+    const M = Method(ProtoIoMsg, ProtoIoMsg){ .path = "/proto.Svc/Echo" };
+    const bytes = try M.encode_req(testing.allocator, .{ .text = "io-ping" });
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("io-ping", bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const msg = try M.decode_res(arena_state.allocator(), "io-pong");
+    try testing.expectEqualStrings("io-pong", msg.text);
+}
