@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        // Zig 0.17: tests use std.c (socketpair/socket/bind/close) and require explicit libc.
+        .link_libc = true,
     });
     test_mod.addImport("zig_http2", h2_mod);
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));

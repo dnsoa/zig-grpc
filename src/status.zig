@@ -38,7 +38,7 @@ pub const Status = struct {
 pub fn codeFromGrpcStatus(value: []const u8) Code {
     const n = std.fmt.parseInt(u8, value, 10) catch return .unknown;
     if (n > 16) return .unknown;
-    return @enumFromInt(n);
+    return @fromBackingInt(@intCast(n));
 }
 
 /// gRPC spec mapping for a non-200 `:status` when the response carries no

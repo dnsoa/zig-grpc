@@ -90,16 +90,21 @@ pub const Channel = struct {
     }
 
     /// Dials plaintext h2c TCP (prior knowledge) and initializes the channel.
-    /// `host` may be an IP literal or a hostname. The channel owns the socket.
-    /// For TLS, wrap your own reader/writer and use `init` instead.
+    /// `host` may be an IPv4/IPv6 literal (bare or `[...]`-bracketed) or a
+    /// hostname. The channel owns the socket. For TLS, wrap your own
+    /// reader/writer and use `init` instead.
     pub fn connectTcp(self: *Channel, io: Io, gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Options) !void {
+        const was_bracketed = host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']';
+        const bare_host = if (was_bracketed) host[1 .. host.len - 1] else host;
+
         const oc = try gpa.create(OwnedConn);
         errdefer gpa.destroy(oc);
         oc.* = .{ .stream = undefined };
-        if (Io.net.IpAddress.parse(host, port)) |a| {
+        if (Io.net.IpAddress.parse(bare_host, port)) |a| {
             var addr = a;
             oc.stream = try addr.connect(io, .{ .mode = .stream });
-        } else |_| {
+        } else |parse_err| {
+            if (was_bracketed) return parse_err;
             const hn = try Io.net.HostName.init(host);
             oc.stream = try hn.connect(io, port, .{ .mode = .stream });
         }
@@ -110,7 +115,7 @@ pub const Channel = struct {
         var o = opts;
         var auth_owned = false;
         if (o.authority.len == 0) {
-            o.authority = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ host, port });
+            o.authority = try formatDefaultAuthority(gpa, bare_host, port);
             auth_owned = true;
         }
         errdefer if (auth_owned) gpa.free(o.authority);
@@ -178,14 +183,29 @@ pub const Channel = struct {
         };
         defer c.deinit();
 
-        c.send(req) catch |e| {
-            recordFailure(&c.raw, call_opts, arena, e);
-            return e;
+        // If `send` or `closeSend` hits `error.StreamReset`, the peer already
+        // ended the stream (e.g. early Trailers-Only + RST_STREAM(NO_ERROR),
+        // graceful GOAWAY refusal, or RST_STREAM(REFUSED_STREAM)), or a local
+        // cancel() fired. In every case the terminal event is already queued on
+        // `h2.Stream`, so fall through to `recv`/`finish` to surface the real
+        // Status instead of collapsing to `Code.unknown`.
+        var send_reset = false;
+        c.send(req) catch |e| switch (e) {
+            error.StreamReset => send_reset = true,
+            else => {
+                recordFailure(&c.raw, call_opts, arena, e);
+                return e;
+            },
         };
-        c.closeSend() catch |e| {
-            recordFailure(&c.raw, call_opts, arena, e);
-            return e;
-        };
+        if (!send_reset) {
+            c.closeSend() catch |e| switch (e) {
+                error.StreamReset => {},
+                else => {
+                    recordFailure(&c.raw, call_opts, arena, e);
+                    return e;
+                },
+            };
+        }
         const res = c.recv(arena) catch |e| {
             recordFailure(&c.raw, call_opts, arena, e);
             return e;
@@ -225,6 +245,15 @@ pub const Channel = struct {
         return res.?;
     }
 };
+
+/// Formats `host:port` for `:authority`, enclosing IPv6 literals in `[...]` per
+/// RFC 3986 §3.2.2 / RFC 9113 §8.3.1.
+fn formatDefaultAuthority(gpa: std.mem.Allocator, bare_host: []const u8, port: u16) ![]u8 {
+    if (std.mem.indexOfScalar(u8, bare_host, ':') != null) {
+        return std.fmt.allocPrint(gpa, "[{s}]:{d}", .{ bare_host, port });
+    }
+    return std.fmt.allocPrint(gpa, "{s}:{d}", .{ bare_host, port });
+}
 
 /// Copies `st` into `call_opts.status_out`, duping the message into `arena` —
 /// a status read off the call points into the call's arena, which dies with it.
@@ -359,7 +388,34 @@ const TcpSrv = struct {
     }
 };
 
+fn canBindTcp4() bool {
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    var sin: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = 0,
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    return std.c.bind(fd, @ptrCast(&sin), @sizeOf(@TypeOf(sin))) == 0;
+}
+
+fn canBindTcp6() bool {
+    const fd = std.c.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    var sin6: std.posix.sockaddr.in6 = .{
+        .family = std.posix.AF.INET6,
+        .port = 0,
+        .flowinfo = 0,
+        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .scope_id = 0,
+    };
+    return std.c.bind(fd, @ptrCast(&sin6), @sizeOf(@TypeOf(sin6))) == 0;
+}
+
 test "connectTcp dials h2c and completes a call" {
+    if (!canBindTcp4()) return error.SkipZigTest;
     const io = testing.io;
     const addr0 = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try addr0.listen(io, .{ .mode = .stream, .reuse_address = true });
@@ -385,6 +441,47 @@ test "connectTcp dials h2c and completes a call" {
     call.deinit();
     chan.deinit(); // close socket → server reads EOF → thread exits
     th.join();
+}
+
+test "connectTcp brackets IPv6 literals in :authority and accepts bracketed hosts (#7)" {
+    const a_v6 = try formatDefaultAuthority(testing.allocator, "::1", 50051);
+    defer testing.allocator.free(a_v6);
+    try testing.expectEqualStrings("[::1]:50051", a_v6);
+
+    const a_v4 = try formatDefaultAuthority(testing.allocator, "127.0.0.1", 50051);
+    defer testing.allocator.free(a_v4);
+    try testing.expectEqualStrings("127.0.0.1:50051", a_v4);
+
+    if (!canBindTcp6()) return error.SkipZigTest;
+    const io = testing.io;
+    const addr6 = try std.Io.net.IpAddress.parse("::1", 0);
+    for ([_][]const u8{ "::1", "[::1]" }) |dial_host| {
+        var listener = try addr6.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer listener.deinit(io);
+        const port = listener.socket.address.getPort();
+
+        var srv: h2.Server = .{ .io = io, .gpa = testing.allocator, .handler = tcpOkHandler };
+        var tsrv: TcpSrv = .{ .io = io, .listener = &listener, .srv = &srv };
+        const th = try std.Thread.spawn(.{}, TcpSrv.run, .{&tsrv});
+
+        var chan: Channel = undefined;
+        try chan.connectTcp(io, testing.allocator, dial_host, port, .{});
+
+        var expected_buf: [32]u8 = undefined;
+        const expected_auth = try std.fmt.bufPrint(&expected_buf, "[::1]:{d}", .{port});
+        try testing.expectEqualStrings(expected_auth, chan.opts.authority);
+
+        var call = try chan.startRaw("/test.Svc/Ok", .{});
+        try call.sendMessage("x");
+        try call.closeSend();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+        try testing.expect((try call.finish()).isOk());
+        call.deinit();
+        chan.deinit();
+        th.join();
+    }
 }
 
 test "metadata with control bytes is rejected before it reaches the wire" {
@@ -554,4 +651,90 @@ test "unary rejects a response carrying more than one message" {
     ));
     // The protocol violation wins over the (OK) trailers the server sent.
     try testing.expectEqual(status_mod.Code.internal, st.code);
+}
+
+const UnaryRunner = struct {
+    chan: *Channel,
+    err: ?anyerror = null,
+    code: status_mod.Code = .ok,
+    msg_buf: [64]u8 = undefined,
+    msg_len: usize = 0,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *UnaryRunner) void {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var st: status_mod.Status = .{ .code = .ok };
+        if (self.chan.unary(UnaryM, arena_state.allocator(), .{ .text = "payload" }, .{ .status_out = &st })) |_| {} else |e| {
+            self.err = e;
+        }
+        self.code = st.code;
+        const n = @min(st.message.len, self.msg_buf.len);
+        @memcpy(self.msg_buf[0..n], st.message[0..n]);
+        self.msg_len = n;
+        self.done.store(true, .release);
+    }
+};
+
+fn zeroInitialWindow(rp: *testutil.RawPeer) !void {
+    var iw0: [6]u8 = undefined;
+    h2.proto.putSetting(&iw0, h2.proto.set_initial_window_size, 0);
+    try rp.writeFrame(.settings, 0, 0, &iw0);
+    while (true) {
+        const f = try rp.readFrame();
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & h2.proto.flag_ack != 0);
+        testing.allocator.free(f.payload);
+        if (is_ack) break;
+    }
+}
+
+test "unary surfaces unavailable (not unknown) when send hits GOAWAY refusal (#6)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    // Force send() to block on flow control until GOAWAY(last_stream_id=0) refuses sid 1.
+    try zeroInitialWindow(&rp);
+
+    var runner: UnaryRunner = .{ .chan = &rp.chan };
+    const th = try std.Thread.spawn(.{}, UnaryRunner.run, .{&runner});
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+
+    var ga: [8]u8 = @splat(0); // last_stream_id = 0, NO_ERROR
+    try rp.writeFrame(.goaway, 0, 0, &ga);
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
+    try testing.expectEqual(status_mod.Code.unavailable, runner.code);
+}
+
+test "unary surfaces server Trailers-Only status when early rejection resets send (#6)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    // Force send() to block while the server immediately answers Trailers-Only
+    // (UNAUTHENTICATED) + RST_STREAM(NO_ERROR) per RFC 7540 §8.1.
+    try zeroInitialWindow(&rp);
+
+    var runner: UnaryRunner = .{ .chan = &rp.chan };
+    const th = try std.Thread.spawn(.{}, UnaryRunner.run, .{&runner});
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try blk.literal(testing.allocator, "grpc-status", "16");
+    try blk.literal(testing.allocator, "grpc-message", "bad%20token");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, blk.buf.items);
+    try rp.writeRst(sid, .no_error);
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
+    try testing.expectEqual(status_mod.Code.unauthenticated, runner.code);
+    try testing.expectEqualStrings("bad token", runner.msg_buf[0..runner.msg_len]);
 }
