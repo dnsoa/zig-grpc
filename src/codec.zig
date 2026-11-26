@@ -6,21 +6,61 @@
 const std = @import("std");
 
 pub fn Method(comptime RequestT: type, comptime ResponseT: type) type {
-    return struct {
-        path: []const u8, // "/pkg.Service/Method"
-        encode_req: *const fn (std.mem.Allocator, RequestT) anyerror![]u8 = defaultEncode(RequestT),
-        decode_res: *const fn (std.mem.Allocator, []const u8) anyerror!ResponseT = defaultDecode(ResponseT),
+    const EncFn = *const fn (std.mem.Allocator, RequestT) anyerror![]u8;
+    const DecFn = *const fn (std.mem.Allocator, []const u8) anyerror!ResponseT;
+    const has_enc = hasCodecFn(RequestT, "encode");
+    const has_dec = hasCodecFn(ResponseT, "decode");
 
-        pub const Req = RequestT;
-        pub const Res = ResponseT;
-    };
+    if (has_enc and has_dec) {
+        return struct {
+            path: []const u8, // "/pkg.Service/Method"
+            encode_req: EncFn = defaultEncode(RequestT),
+            decode_res: DecFn = defaultDecode(ResponseT),
+            pub const Req = RequestT;
+            pub const Res = ResponseT;
+        };
+    } else if (has_enc) {
+        return struct {
+            path: []const u8, // "/pkg.Service/Method"
+            encode_req: EncFn = defaultEncode(RequestT),
+            decode_res: DecFn,
+            pub const Req = RequestT;
+            pub const Res = ResponseT;
+        };
+    } else if (has_dec) {
+        return struct {
+            path: []const u8, // "/pkg.Service/Method"
+            encode_req: EncFn,
+            decode_res: DecFn = defaultDecode(ResponseT),
+            pub const Req = RequestT;
+            pub const Res = ResponseT;
+        };
+    } else {
+        return struct {
+            path: []const u8, // "/pkg.Service/Method"
+            encode_req: EncFn,
+            decode_res: DecFn,
+            pub const Req = RequestT;
+            pub const Res = ResponseT;
+        };
+    }
+}
+
+fn hasCodecFn(comptime T: type, comptime name: []const u8) bool {
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {
+            if (!@hasDecl(T, name)) return false;
+            return @typeInfo(@TypeOf(@field(T, name))) == .@"fn";
+        },
+        else => return false,
+    }
 }
 
 /// Whether `T.encode` uses the current zig-protobuf Io signature
 /// `encode(self, *std.Io.Writer, allocator)` (vs the legacy `encode(self, allocator) []u8`).
 fn encodesViaWriter(comptime T: type) bool {
+    if (!hasCodecFn(T, "encode")) return false;
     const info = @typeInfo(@TypeOf(@field(T, "encode")));
-    if (info != .@"fn") return false;
     const params = info.@"fn".param_types;
     if (params.len >= 2) {
         if (params[1]) |pt| return pt == *std.Io.Writer;
@@ -31,8 +71,8 @@ fn encodesViaWriter(comptime T: type) bool {
 /// Whether `T.decode` uses the current zig-protobuf Io signature
 /// `decode(*std.Io.Reader, allocator)` (vs the legacy `decode(allocator, bytes)`).
 fn decodesViaReader(comptime T: type) bool {
+    if (!hasCodecFn(T, "decode")) return false;
     const info = @typeInfo(@TypeOf(@field(T, "decode")));
-    if (info != .@"fn") return false;
     const params = info.@"fn".param_types;
     if (params.len >= 1) {
         if (params[0]) |pt| return pt == *std.Io.Reader;
@@ -113,4 +153,28 @@ test "codec functions are overridable per method" {
     const bytes = try M.encode_req(testing.allocator, .{ .text = "up" });
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings("UP", bytes);
+}
+
+test "Method compiles for raw slices and plain structs without encode/decode decls" {
+    const Plain = struct { code: u32 };
+    const H = struct {
+        fn encSlice(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+            return gpa.dupe(u8, s);
+        }
+        fn decPlain(_: std.mem.Allocator, bytes: []const u8) anyerror!Plain {
+            if (bytes.len != 4) return error.Malformed;
+            return .{ .code = std.mem.readInt(u32, bytes[0..4], .big) };
+        }
+    };
+    const M = Method([]const u8, Plain){
+        .path = "/raw.Svc/Op",
+        .encode_req = &H.encSlice,
+        .decode_res = &H.decPlain,
+    };
+    const wire = try M.encode_req(testing.allocator, &.{ 0, 0, 0, 42 });
+    defer testing.allocator.free(wire);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try M.decode_res(arena_state.allocator(), wire);
+    try testing.expectEqual(@as(u32, 42), res.code);
 }

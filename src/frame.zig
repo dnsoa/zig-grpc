@@ -43,11 +43,13 @@ pub const Assembler = struct {
         const flag = avail[0];
         if (flag > 1) return error.MalformedFrame;
         if (flag == 1) return error.CompressedUnsupported;
-        const len = std.mem.readInt(u32, avail[1..prefix_len], .big);
-        if (len > self.max_message_size) return error.MessageTooLarge;
-        if (avail.len < prefix_len + len) return null;
-        const msg = try arena.dupe(u8, avail[prefix_len .. prefix_len + len]);
-        self.head += prefix_len + len;
+        const raw_len = std.mem.readInt(u32, avail[1..prefix_len], .big);
+        if (raw_len > self.max_message_size) return error.MessageTooLarge;
+        const len = std.math.cast(usize, raw_len) orelse return error.MessageTooLarge;
+        if (avail.len - prefix_len < len) return null;
+        const frame_len = prefix_len + len;
+        const msg = try arena.dupe(u8, avail[prefix_len..frame_len]);
+        self.head += frame_len;
         self.reclaim();
         return msg;
     }
@@ -177,6 +179,18 @@ test "hasPartial reports a truncated message" {
     const p = encodePrefix(4);
     try a.feed(&p);
     try a.feed("ab"); // 4 declared, only 2 arrived
+    try testing.expect((try a.next(arena_state.allocator())) == null);
+    try testing.expect(a.hasPartial());
+}
+
+test "near-maxInt(u32) frame length with uncapped max_message_size does not overflow" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var a = Assembler.init(testing.allocator, std.math.maxInt(u32));
+    defer a.deinit();
+    // 0xffff_fffb..0xffff_ffff wrapped `prefix_len + len` when evaluated in u32.
+    const p = encodePrefix(std.math.maxInt(u32));
+    try a.feed(&p);
     try testing.expect((try a.next(arena_state.allocator())) == null);
     try testing.expect(a.hasPartial());
 }

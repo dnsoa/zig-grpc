@@ -10,8 +10,8 @@ bidirectional streaming all work against a real grpc-go server
 (see [Go interop](#go-interop)). The server side is scaffolded (shared types +
 method registry); the connection-serving path is later work.
 
-- Zig 0.16.0 (`std.Io` model)
-- Single dependency: [`zig_http2`](https://github.com/dnsoa/zig-http2), pinned by commit + hash in `build.zig.zon`
+- Zig 0.17.0 (`std.Io` model)
+- Single dependency: [`zig_http2`](https://github.com/dnsoa/zig-http2), v0.2.0, pinned by tag + hash in `build.zig.zon`
 - Plaintext h2c only (TLS is the caller's job — wrap your own reader/writer)
 
 ## Quickstart

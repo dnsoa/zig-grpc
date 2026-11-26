@@ -123,6 +123,15 @@ pub const RawCall = struct {
         _ = self.chan.live_calls.fetchSub(1, .monotonic);
     }
 
+    /// Unlocks `recv_mu` and, if the response-head phase is still undecided
+    /// (e.g. an unclassified error such as OOM aborted `step()` while `state`
+    /// remained `.awaiting_headers`), wakes any `header()` waiters AFTER the
+    /// mutex is free so one can take over instead of hanging forever.
+    fn releaseRecvMu(self: *RawCall) void {
+        self.recv_mu.unlock(self.chan.io);
+        if (!self.head_settled.load(.acquire)) self.wakeHeadWaiters();
+    }
+
     /// Reads the next response message into `arena`. Returns null once the
     /// server has finished (trailers received) — then `finish()` has the
     /// status. Transport faults are Zig errors; `stat` still carries the
@@ -133,7 +142,7 @@ pub const RawCall = struct {
     /// (whoever gets the lock consumes the next event).
     pub fn recvMessage(self: *RawCall, arena: std.mem.Allocator) !?[]u8 {
         self.recv_mu.lockUncancelable(self.chan.io);
-        defer self.recv_mu.unlock(self.chan.io);
+        defer self.releaseRecvMu();
         return self.recvLocked(arena);
     }
 
@@ -146,7 +155,7 @@ pub const RawCall = struct {
                     error.MessageTooLarge => .{ .code = .resource_exhausted, .message = "message exceeds max_recv_message_size" },
                     error.CompressedUnsupported => .{ .code = .internal, .message = "compressed message but compression is unsupported" },
                     error.MalformedFrame => .{ .code = .internal, .message = "malformed message frame" },
-                    else => .{ .code = .internal, .message = "receive failure" },
+                    error.OutOfMemory => .{ .code = .resource_exhausted, .message = "out of memory" },
                 };
                 self.abandon();
                 return e;
@@ -174,21 +183,25 @@ pub const RawCall = struct {
             // Nobody is driving the receive path — drive it ourselves, far
             // enough to get the head phase decided.
             if (self.recv_mu.tryLock()) {
-                defer self.recv_mu.unlock(self.chan.io);
-                // Release any waiters even when we leave by error: an
-                // unclassified transport error can return with `state` still
-                // `.awaiting_headers`, in which case step()'s own wakeup does
-                // not fire and they would wait forever. They re-check and take
-                // over from the top of the loop.
-                defer self.wakeHeadWaiters();
+                defer self.releaseRecvMu();
                 while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
                 return self.resp_headers orelse .{};
             }
 
-            // Someone else is driving. Wait for the head phase to be *decided*,
-            // not for the lock they are holding.
+            // Someone else is driving. Wait for the head phase to be *decided*
+            // (or for the driver to bail out), re-checking `tryLock()` under
+            // `head_mu` so an exit between the outer `tryLock()` and acquiring
+            // `head_mu` cannot lose its wakeup.
             self.head_mu.lockUncancelable(self.chan.io);
-            if (!self.head_settled.load(.acquire)) self.head_cond.waitUncancelable(self.chan.io, &self.head_mu);
+            if (!self.head_settled.load(.acquire)) {
+                if (self.recv_mu.tryLock()) {
+                    self.head_mu.unlock(self.chan.io);
+                    defer self.releaseRecvMu();
+                    while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
+                    return self.resp_headers orelse .{};
+                }
+                self.head_cond.waitUncancelable(self.chan.io, &self.head_mu);
+            }
             self.head_mu.unlock(self.chan.io);
             // Loop: either it settled, or the driver bailed and we take over.
         }
@@ -207,7 +220,7 @@ pub const RawCall = struct {
     /// convenience). NOTE: blocks until the server ends the stream.
     pub fn finish(self: *RawCall) !Status {
         self.recv_mu.lockUncancelable(self.chan.io);
-        defer self.recv_mu.unlock(self.chan.io);
+        defer self.releaseRecvMu();
         var scratch = std.heap.ArenaAllocator.init(self.chan.gpa);
         defer scratch.deinit();
         while (self.state != .done) {
@@ -301,30 +314,46 @@ pub const RawCall = struct {
         const arena = self.arena_state.allocator();
         switch (self.state) {
             .awaiting_headers => {
+                const http_status = findHeader(hs, ":status") orelse "";
+                const parsed = std.fmt.parseInt(u16, http_status, 10) catch 0;
+                // RFC 9113 §8.1: non-101 1xx informational headers (e.g. 100
+                // Continue, 103 Early Hints) precede the final response HEADERS
+                // without ending the stream; ignore them and keep waiting.
+                if (!end_stream and parsed >= 100 and parsed < 200 and parsed != 101) {
+                    return;
+                }
+                if (parsed != 200) {
+                    self.stat = .{
+                        .code = status_mod.codeFromHttpStatus(parsed),
+                        .message = try std.fmt.allocPrint(arena, "unexpected HTTP status \"{s}\"", .{http_status}),
+                    };
+                    if (end_stream) {
+                        self.resp_trailers = try dupEntries(arena, hs);
+                        self.state = .done;
+                    } else {
+                        self.abandon();
+                    }
+                    return;
+                }
+                const ct = findHeader(hs, "content-type") orelse "";
+                if (!isGrpcContentType(ct)) {
+                    self.stat = .{
+                        .code = .internal,
+                        .message = try std.fmt.allocPrint(arena, "bad content-type \"{s}\"", .{ct}),
+                    };
+                    if (end_stream) {
+                        self.resp_trailers = try dupEntries(arena, hs);
+                        self.state = .done;
+                    } else {
+                        self.abandon();
+                    }
+                    return;
+                }
                 if (end_stream) {
                     // Trailers-Only: the whole response is this one HEADERS block.
                     self.stat = try parseTrailerStatus(arena, hs, true);
                     self.resp_trailers = try dupEntries(arena, hs);
                     self.state = .done;
-                    return;
-                }
-                const http_status = findHeader(hs, ":status") orelse "";
-                if (!std.mem.eql(u8, http_status, "200")) {
-                    const parsed = std.fmt.parseInt(u16, http_status, 10) catch 0;
-                    self.stat = .{
-                        .code = status_mod.codeFromHttpStatus(parsed),
-                        .message = try std.fmt.allocPrint(arena, "unexpected HTTP status \"{s}\"", .{http_status}),
-                    };
-                    self.abandon();
-                    return;
-                }
-                const ct = findHeader(hs, "content-type") orelse "";
-                if (!std.mem.startsWith(u8, ct, "application/grpc")) {
-                    self.stat = .{
-                        .code = .internal,
-                        .message = try std.fmt.allocPrint(arena, "bad content-type \"{s}\"", .{ct}),
-                    };
-                    self.abandon();
                     return;
                 }
                 if (findHeader(hs, "grpc-encoding")) |enc| {
@@ -341,6 +370,15 @@ pub const RawCall = struct {
                 self.state = .open;
             },
             .open => {
+                if (!end_stream) {
+                    // HTTP/2 trailing HEADERS must carry END_STREAM (RFC 9113 §8.1).
+                    self.stat = .{
+                        .code = .internal,
+                        .message = "mid-stream HEADERS without END_STREAM",
+                    };
+                    self.abandon();
+                    return;
+                }
                 self.stat = try parseTrailerStatus(arena, hs, false);
                 self.resp_trailers = try dupEntries(arena, hs);
                 self.state = .done;
@@ -356,6 +394,14 @@ pub const RawCall = struct {
         self.state = .done;
     }
 };
+
+fn isGrpcContentType(ct: []const u8) bool {
+    const prefix = "application/grpc";
+    if (ct.len < prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(ct[0..prefix.len], prefix)) return false;
+    if (ct.len == prefix.len) return true;
+    return ct[prefix.len] == '+' or ct[prefix.len] == ';';
+}
 
 fn findHeader(hs: []const h2.hpack.Header, name: []const u8) ?[]const u8 {
     for (hs) |h| {
@@ -388,15 +434,7 @@ fn parseTrailerStatus(arena: std.mem.Allocator, hs: []const h2.hpack.Header, tra
         return .{ .code = status_mod.codeFromGrpcStatus(gs), .message = msg };
     }
     if (trailers_only) {
-        const hsv = findHeader(hs, ":status") orelse "";
-        const parsed = std.fmt.parseInt(u16, hsv, 10) catch 0;
-        // HTTP said OK, so nothing at the transport level went wrong — the
-        // response is simply malformed. `codeFromHttpStatus(200)` would call it
-        // `unknown`, which reads as "the peer reported a status we don't
-        // recognize" when in fact it reported none. Only a non-200 gets the
-        // HTTP mapping (a proxy answering instead of a gRPC server).
-        if (parsed == 200) return .{ .code = .internal, .message = "trailers-only response without grpc-status" };
-        return .{ .code = status_mod.codeFromHttpStatus(parsed), .message = "missing grpc-status" };
+        return .{ .code = .internal, .message = "trailers-only response without grpc-status" };
     }
     return .{ .code = .internal, .message = "missing grpc-status in trailers" };
 }
@@ -866,12 +904,14 @@ test "DATA before response HEADERS is a protocol error, not a message" {
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    // No message is delivered, and the call ends internal rather than OK.
+    // No message is delivered, and the call ends internal rather than OK
+    // (rejected either by zig-http2's stream validator as RST(PROTOCOL_ERROR)
+    // or by RawCall's awaiting_headers guard).
     try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
     const st = try call.finish();
     try testing.expectEqual(status_mod.Code.internal, st.code);
-    try testing.expectEqualStrings("DATA received before response headers", st.message);
-    // abandon() tells the server to stop.
+    try testing.expect(st.message.len > 0);
+    // Peer receives RST_STREAM either way.
     const rst = try rp.readUntil(.rst_stream);
     testing.allocator.free(rst.payload);
 }
@@ -1171,4 +1211,203 @@ test "trailers-only with HTTP 200 and no grpc-status is internal, not unknown" {
     defer arena_state.deinit();
     try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
     try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+}
+
+test "1xx informational HEADERS before 200 response HEADERS are ignored (#8)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/X", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // 100 Continue (no END_STREAM), then 200 OK + message + trailers.
+    var b100: testutil.RawPeer.HpackBlock = .{};
+    defer b100.deinit(testing.allocator);
+    try b100.literal(testing.allocator, ":status", "100");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, b100.buf.items);
+
+    var b200: testutil.RawPeer.HpackBlock = .{};
+    defer b200.deinit(testing.allocator);
+    try b200.status200(testing.allocator);
+    try b200.literal(testing.allocator, "content-type", "application/grpc+proto");
+    try b200.literal(testing.allocator, "x-after-100", "yes");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, b200.buf.items);
+
+    const msg = [_]u8{ 0, 0, 0, 0, 2 } ++ "ok".*;
+    try rp.writeFrame(.data, 0, sid, &msg);
+
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const hdrs = try call.header();
+    try testing.expectEqualStrings("yes", hdrs.get("x-after-100").?);
+    try testing.expectEqualStrings("ok", (try call.recvMessage(arena_state.allocator())).?);
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expect((try call.finish()).isOk());
+}
+
+test "trailers-only checks :status and content-type before trusting grpc-status (#8)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    // 1) Proxy 502 with END_STREAM + stray grpc-status: 0 must map to unavailable, not OK.
+    {
+        var call = try rp.chan.startRaw("/test.Svc/BadGateway", .{});
+        defer call.deinit();
+        try call.closeSend();
+        const hf = try rp.readUntil(.headers);
+        testing.allocator.free(hf.payload);
+
+        var blk: testutil.RawPeer.HpackBlock = .{};
+        defer blk.deinit(testing.allocator);
+        try blk.literal(testing.allocator, ":status", "502");
+        try blk.literal(testing.allocator, "content-type", "text/html");
+        try blk.literal(testing.allocator, "grpc-status", "0");
+        try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, hf.hdr.sid, blk.buf.items);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+        try testing.expectEqual(status_mod.Code.unavailable, (try call.finish()).code);
+    }
+
+    // 2) HTTP 200 with non-gRPC content-type + grpc-status: 0 must map to internal, not OK.
+    {
+        var call = try rp.chan.startRaw("/test.Svc/Html200", .{});
+        defer call.deinit();
+        try call.closeSend();
+        const hf = try rp.readUntil(.headers);
+        testing.allocator.free(hf.payload);
+
+        var blk: testutil.RawPeer.HpackBlock = .{};
+        defer blk.deinit(testing.allocator);
+        try blk.status200(testing.allocator);
+        try blk.literal(testing.allocator, "content-type", "text/html");
+        try blk.literal(testing.allocator, "grpc-status", "0");
+        try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, hf.hdr.sid, blk.buf.items);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+        try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+    }
+}
+
+test "mid-stream HEADERS without END_STREAM maps to internal and resets the stream (#8)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/MidHdr", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    var blk: testutil.RawPeer.HpackBlock = .{};
+    defer blk.deinit(testing.allocator);
+    try blk.status200(testing.allocator);
+    try blk.literal(testing.allocator, "content-type", "application/grpc");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+    // Second HEADERS without END_STREAM carrying grpc-status: 0 — illegal trailers.
+    var bad: testutil.RawPeer.HpackBlock = .{};
+    defer bad.deinit(testing.allocator);
+    try bad.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, bad.buf.items);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try call.recvMessage(arena_state.allocator())) == null);
+    try testing.expectEqual(status_mod.Code.internal, (try call.finish()).code);
+    const rst = try rp.readUntil(.rst_stream);
+    testing.allocator.free(rst.payload);
+}
+
+test "header() waiter wakes and takes over when recvMessage exits on OOM (#10)" {
+    var rp: testutil.RawPeer = undefined;
+    try rp.start(testing.io, testing.allocator);
+    defer rp.stop();
+
+    var call = try rp.chan.startRaw("/test.Svc/OomWake", .{});
+    defer call.deinit();
+    try call.closeSend();
+    const hf = try rp.readUntil(.headers);
+    testing.allocator.free(hf.payload);
+    const sid = hf.hdr.sid;
+
+    // Fail the first `arena_state` allocation (inside `onHeaders` -> `dupEntries`
+    // on `th_recv`) while `state` is still `.awaiting_headers` and `head_settled`
+    // is false; `readEvent` itself already freed the h2 queue entry cleanly.
+    var fail_once = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    call.arena_state.deinit();
+    call.arena_state = std.heap.ArenaAllocator.init(fail_once.allocator());
+
+    var recv: BlockedRecv = .{ .call = &call };
+    const th_recv = try std.Thread.spawn(.{}, BlockedRecv.run, .{&recv});
+    std.Io.sleep(testing.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    var waiter: HeaderWaiter = .{ .call = &call };
+    const th_hdr = try std.Thread.spawn(.{}, HeaderWaiter.run, .{&waiter});
+    std.Io.sleep(testing.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    var b1: testutil.RawPeer.HpackBlock = .{};
+    defer b1.deinit(testing.allocator);
+    try b1.status200(testing.allocator);
+    try b1.literal(testing.allocator, "content-type", "application/grpc");
+    try b1.literal(testing.allocator, "x-attempt", "1");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, b1.buf.items);
+
+    th_recv.join();
+    call.arena_state.deinit();
+    call.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+
+    // Trailing HEADERS (END_STREAM) settles the call so the woken `th_hdr`
+    // takes over `recv_mu`, drives `step()`, and returns cleanly.
+    var tblk: testutil.RawPeer.HpackBlock = .{};
+    defer tblk.deinit(testing.allocator);
+    try tblk.literal(testing.allocator, "grpc-status", "0");
+    try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+
+    var finished = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (waiter.done.load(.acquire)) {
+            finished = true;
+            break;
+        }
+        std.Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    if (!finished) call.cancel();
+    th_hdr.join();
+
+    try testing.expect(finished);
+    try testing.expectEqual(@as(?anyerror, null), waiter.err);
+    try testing.expectEqual(@as(usize, 0), waiter.entries);
+}
+
+test "recvMessage maps caller arena OutOfMemory to resource_exhausted (#10)" {
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, unaryEchoHandler, null, .{});
+    defer lb.stop();
+
+    var call = try lb.chan.startRaw("/test.Svc/Echo", .{});
+    defer call.deinit();
+    try call.sendMessage("hello");
+    try call.closeSend();
+
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, call.recvMessage(fail.allocator()));
+    try testing.expectEqual(status_mod.Code.resource_exhausted, (try call.finish()).code);
 }

@@ -1,5 +1,5 @@
 //! Test-only helper: an in-process zig-http2 server the client talks to over
-//! a real TCP loopback socket (the same pattern zig-http2's own tests use).
+//! an AF_UNIX socketpair (the same pattern zig-http2's own tests use).
 //! Not referenced outside `test` blocks.
 
 const std = @import("std");
@@ -7,11 +7,23 @@ const h2 = @import("zig_http2");
 const channel_mod = @import("channel.zig");
 const Io = std.Io;
 
+fn makeSocketPairStreams() !struct { client: Io.net.Stream, server: Io.net.Stream } {
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    const dummy_addr = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    return .{
+        .client = .{ .socket = .{ .handle = fds[0], .address = dummy_addr } },
+        .server = .{ .socket = .{ .handle = fds[1], .address = dummy_addr } },
+    };
+}
+
 pub const Loopback = struct {
     io: Io,
     gpa: std.mem.Allocator,
-    listener: Io.net.Server,
     cstream: Io.net.Stream,
+    sstream: Io.net.Stream,
     crbuf: [8192]u8 = undefined,
     cwbuf: [8192]u8 = undefined,
     csr: Io.net.Stream.Reader = undefined,
@@ -32,15 +44,15 @@ pub const Loopback = struct {
     ) !void {
         self.io = io;
         self.gpa = gpa;
-        const addr0 = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = try addr0.listen(io, .{ .mode = .stream, .reuse_address = true });
-        errdefer self.listener.deinit(io);
-        const port = self.listener.socket.address.ip4.port;
-        const caddr = try Io.net.IpAddress.parse("127.0.0.1", port);
-        self.cstream = try caddr.connect(io, .{ .mode = .stream });
+        const pair = try makeSocketPairStreams();
+        self.cstream = pair.client;
+        self.sstream = pair.server;
         errdefer self.cstream.close(io);
         self.srv = .{ .io = io, .gpa = gpa, .handler = handler, .userdata = userdata };
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        self.thread = std.Thread.spawn(.{}, serve, .{self}) catch |err| {
+            self.sstream.close(io);
+            return err;
+        };
         self.csr = self.cstream.reader(io, &self.crbuf);
         self.csw = self.cstream.writer(io, &self.cwbuf);
         var opts = chan_opts;
@@ -49,22 +61,21 @@ pub const Loopback = struct {
     }
 
     fn serve(self: *Loopback) void {
-        var accepted = self.listener.accept(self.io) catch return;
-        defer accepted.close(self.io);
+        defer self.sstream.close(self.io);
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
-        var sr = accepted.reader(self.io, &rbuf);
-        var sw = accepted.writer(self.io, &wbuf);
+        var sr = self.sstream.reader(self.io, &rbuf);
+        var sw = self.sstream.writer(self.io, &wbuf);
         h2.serveConn(&self.srv, &sr.interface, &sw.interface, null, "http");
     }
 
-    /// Tears down in LIFO order: channel (client GOAWAY/close) → client socket
-    /// (server read loop sees EOF and exits) → join → listener.
+    /// Tears down in LIFO order: shutdown+close client socket so both reader
+    /// loops see EOF → channel deinit → join server thread.
     pub fn stop(self: *Loopback) void {
+        self.cstream.shutdown(self.io, .both) catch {};
         self.chan.deinit();
         self.cstream.close(self.io);
         if (self.thread) |t| t.join();
-        self.listener.deinit(self.io);
     }
 };
 
@@ -74,7 +85,6 @@ pub const Loopback = struct {
 pub const RawPeer = struct {
     io: Io,
     gpa: std.mem.Allocator,
-    listener: Io.net.Server,
     cstream: Io.net.Stream,
     crbuf: [8192]u8 = undefined,
     cwbuf: [8192]u8 = undefined,
@@ -93,12 +103,13 @@ pub const RawPeer = struct {
     pub fn start(self: *RawPeer, io: Io, gpa: std.mem.Allocator) !void {
         self.io = io;
         self.gpa = gpa;
-        const addr0 = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = try addr0.listen(io, .{ .mode = .stream, .reuse_address = true });
-        const port = self.listener.socket.address.ip4.port;
-        const caddr = try Io.net.IpAddress.parse("127.0.0.1", port);
-        self.cstream = try caddr.connect(io, .{ .mode = .stream });
-        self.accepted = try self.listener.accept(io);
+        const pair = try makeSocketPairStreams();
+        self.cstream = pair.client;
+        self.accepted = pair.server;
+        errdefer {
+            self.cstream.close(io);
+            self.accepted.close(io);
+        }
         self.csr = self.cstream.reader(io, &self.crbuf);
         self.csw = self.cstream.writer(io, &self.cwbuf);
         self.asr = self.accepted.reader(io, &self.arbuf);
@@ -144,7 +155,7 @@ pub const RawPeer = struct {
 
     pub fn writeRst(self: *RawPeer, sid: u31, code: h2.proto.ErrorCode) !void {
         var p: [4]u8 = undefined;
-        std.mem.writeInt(u32, &p, @intFromEnum(code), .big);
+        std.mem.writeInt(u32, &p, @backingInt(code), .big);
         try self.writeFrame(.rst_stream, 0, sid, &p);
     }
 
@@ -173,9 +184,10 @@ pub const RawPeer = struct {
     };
 
     pub fn stop(self: *RawPeer) void {
+        self.cstream.shutdown(self.io, .both) catch {};
+        self.accepted.shutdown(self.io, .both) catch {};
         self.chan.deinit();
         self.cstream.close(self.io);
         self.accepted.close(self.io);
-        self.listener.deinit(self.io);
     }
 };

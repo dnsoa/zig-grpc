@@ -23,17 +23,24 @@ pub const Metadata = struct {
     /// library call taking a caller-supplied string, and an assert would abort
     /// the process over it in every safe build.
     pub fn getBin(self: Metadata, arena: std.mem.Allocator, name: []const u8) !?[]u8 {
-        if (!std.mem.endsWith(u8, name, "-bin")) return error.NotBinaryMetadata;
+        if (name.len < 4 or !std.ascii.eqlIgnoreCase(name[name.len - 4 ..], "-bin")) {
+            return error.NotBinaryMetadata;
+        }
         const v = self.get(name) orelse return null;
-        // Manually remove trailing '=' padding
+        // Manually remove at most two trailing '=' padding bytes when aligned.
         var trimmed_len = v.len;
         while (trimmed_len > 0 and v[trimmed_len - 1] == '=') {
             trimmed_len -= 1;
+        }
+        const pad_count = v.len - trimmed_len;
+        if (pad_count > 0 and (pad_count > 2 or trimmed_len == 0 or v.len % 4 != 0)) {
+            return error.InvalidBase64;
         }
         const trimmed = v[0..trimmed_len];
         const dec = std.base64.standard_no_pad.Decoder;
         const n = dec.calcSizeForSlice(trimmed) catch return error.InvalidBase64;
         const out = try arena.alloc(u8, n);
+        errdefer arena.free(out);
         dec.decode(out, trimmed) catch return error.InvalidBase64;
         return out;
     }
@@ -83,7 +90,10 @@ pub fn isValidValue(value: []const u8) bool {
 }
 
 /// Encodes a deadline as a `grpc-timeout` value: at most 8 digits plus a
-/// unit, smallest unit that fits, rounding up so a deadline never shortens.
+/// unit (`H`/`M`/`S`/`m`/`u`/`n`). Prefers the coarsest unit that represents
+/// `ns` exactly within 8 digits (e.g. 30s -> `30S`, 1.5s -> `1500m`), and
+/// otherwise falls back to the smallest unit that fits, rounding up so a
+/// deadline never shortens.
 pub fn encodeTimeout(ns: u64, buf: *[9]u8) []const u8 {
     const max: u64 = 99_999_999;
     const threshold: u64 = 999;
@@ -91,19 +101,37 @@ pub fn encodeTimeout(ns: u64, buf: *[9]u8) []const u8 {
         .{ .div = 1, .unit = 'n' },
         .{ .div = std.time.ns_per_us, .unit = 'u' },
         .{ .div = std.time.ns_per_ms, .unit = 'm' },
+        .{ .div = std.time.ns_per_s, .unit = 'S' },
+        .{ .div = std.time.ns_per_min, .unit = 'M' },
+        .{ .div = std.time.ns_per_hour, .unit = 'H' },
     };
-    // First pass: prefer units where v <= threshold
-    for (units) |u| {
+    // Exact pass: prefer the coarsest unit (H..u) that fits without rounding,
+    // e.g. 30s -> "30S" and 1.5s -> "1500m" (not "2S").
+    if (ns > 0) {
+        var i: usize = units.len;
+        while (i > 1) {
+            i -= 1;
+            const u = units[i];
+            if (ns % u.div == 0) {
+                const v = ns / u.div;
+                if (v <= max) return std.fmt.bufPrint(buf, "{d}{c}", .{ v, u.unit }) catch unreachable;
+                // Every finer unit produces an even larger quotient (> max).
+                break;
+            }
+        }
+    }
+    // First rounding pass: prefer compact sub-second units (n/u/m) where v <= threshold.
+    for (units[0..3]) |u| {
         const v = std.math.divCeil(u64, ns, u.div) catch unreachable;
         if (v <= threshold) return std.fmt.bufPrint(buf, "{d}{c}", .{ v, u.unit }) catch unreachable;
     }
-    // Second pass: fall back to v <= max
-    for (units) |u| {
+    // Second rounding pass: smallest spec unit (n/u/m/S/M) that fits within 8 digits.
+    for (units[0..5]) |u| {
         const v = std.math.divCeil(u64, ns, u.div) catch unreachable;
         if (v <= max) return std.fmt.bufPrint(buf, "{d}{c}", .{ v, u.unit }) catch unreachable;
     }
-    // Over 99999999 milliseconds (~27.8h): fall back to hours. The largest u64
-    // ns is ~5.1M hours (7 digits), so it always fits the 8-digit budget.
+    // Over 99_999_999 minutes: fall back to hours. Largest u64 ns is ~5.1M hours
+    // (7 digits), so it always fits the 8-digit budget.
     const v_h = std.math.divCeil(u64, ns, std.time.ns_per_hour) catch unreachable;
     return std.fmt.bufPrint(buf, "{d}H", .{v_h}) catch unreachable;
 }
@@ -142,22 +170,34 @@ test "isReservedName blocks pseudo, grpc-*, and transport headers" {
     try testing.expect(!isReservedName("authorization"));
 }
 
-test "encodeTimeout picks the smallest unit that fits, rounding up" {
+test "encodeTimeout prefers exact coarser units and otherwise rounds up" {
     var buf: [9]u8 = undefined;
+    try testing.expectEqualStrings("0n", encodeTimeout(0, &buf));
     try testing.expectEqualStrings("100n", encodeTimeout(100, &buf));
-    try testing.expectEqualStrings("1000000u", encodeTimeout(std.time.ns_per_s, &buf));
-    try testing.expectEqualStrings("300000m", encodeTimeout(5 * std.time.ns_per_min, &buf));
-    // 向上取整:1500ns 不能编成 1u(会缩短 deadline)
+    try testing.expectEqualStrings("1500u", encodeTimeout(1_500 * std.time.ns_per_us, &buf));
+    try testing.expectEqualStrings("1500m", encodeTimeout(1_500 * std.time.ns_per_ms, &buf));
+    try testing.expectEqualStrings("1S", encodeTimeout(std.time.ns_per_s, &buf));
+    try testing.expectEqualStrings("30S", encodeTimeout(30 * std.time.ns_per_s, &buf));
+    try testing.expectEqualStrings("100S", encodeTimeout(100 * std.time.ns_per_s, &buf));
+    try testing.expectEqualStrings("5M", encodeTimeout(5 * std.time.ns_per_min, &buf));
+    // Non-exact durations keep smallest-unit-that-fits and round up so deadlines never shorten.
     try testing.expectEqualStrings("2u", encodeTimeout(1_500, &buf));
-    try testing.expectEqualStrings("100000m", encodeTimeout(100_000_000_000, &buf));
+    try testing.expectEqualStrings("1000001u", encodeTimeout(std.time.ns_per_s + 1, &buf));
+    try testing.expectEqualStrings("100001m", encodeTimeout(100 * std.time.ns_per_s + 1, &buf));
 }
 
-test "encodeTimeout falls back to hours without trailing garbage" {
+test "encodeTimeout uses S/M before falling back to hours without trailing garbage" {
     var buf: [9]u8 = undefined;
-    // > 99_999_999 ms (~27.8h) forces the hours branch; the returned slice
-    // must be exactly the printed value, not the whole backing buffer.
+    // Exact multi-hour/minute values prefer coarser units without rounding loss.
+    try testing.expectEqualStrings("1681M", encodeTimeout(28 * std.time.ns_per_hour + std.time.ns_per_min, &buf));
     try testing.expectEqualStrings("48H", encodeTimeout(48 * std.time.ns_per_hour, &buf));
-    // Largest u64 ns is ~5.1M hours (8 digits) — still a clean slice, no tail.
+    // > 99_999_999 ms (~27.8h) non-exact uses 'S' instead of rounding up by nearly an hour.
+    try testing.expectEqualStrings("100861S", encodeTimeout(28 * std.time.ns_per_hour + std.time.ns_per_min + 500 * std.time.ns_per_ms, &buf));
+    // > 99_999_999 S (~3.17y) uses 'M' (both exact overflow and non-exact).
+    try testing.expectEqualStrings("3333334M", encodeTimeout(200_000_000 * std.time.ns_per_s, &buf));
+    try testing.expectEqualStrings("2000001M", encodeTimeout(2_000_000 * std.time.ns_per_min + 1, &buf));
+    // > 99_999_999 M forces the hours branch; returned slice has no trailing garbage.
+    try testing.expectEqualStrings("2000001H", encodeTimeout(2_000_000 * std.time.ns_per_hour + 1, &buf));
     try testing.expectEqualStrings("5124096H", encodeTimeout(std.math.maxInt(u64), &buf));
 }
 
@@ -192,4 +232,23 @@ test "getBin rejects a non -bin name instead of asserting" {
     // Previously std.debug.assert — an abort, in every safe build, over a
     // caller-supplied string.
     try testing.expectError(error.NotBinaryMetadata, md.getBin(arena_state.allocator(), "k"));
+}
+
+test "getBin accepts case-insensitive -bin suffix and rejects malformed '=' padding" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const md: Metadata = .{ .entries = &.{
+        .{ .name = "x-payload-bin", .value = "aGk=" },
+        .{ .name = "empty-bin", .value = "" },
+        .{ .name = "only-pad-bin", .value = "====" },
+        .{ .name = "over-pad-bin", .value = "aGk=====" },
+        .{ .name = "misaligned-pad-bin", .value = "aGk==" },
+    } };
+    try testing.expectEqualStrings("hi", (try md.getBin(arena, "X-Payload-Bin")).?);
+    try testing.expectEqualStrings("hi", (try md.getBin(arena, "X-PAYLOAD-BIN")).?);
+    try testing.expectEqualStrings("", (try md.getBin(arena, "empty-bin")).?);
+    try testing.expectError(error.InvalidBase64, md.getBin(arena, "only-pad-bin"));
+    try testing.expectError(error.InvalidBase64, md.getBin(arena, "over-pad-bin"));
+    try testing.expectError(error.InvalidBase64, md.getBin(arena, "misaligned-pad-bin"));
 }
