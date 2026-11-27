@@ -115,6 +115,12 @@ while (try call.recv(arena)) |r| { ... } // drain server-stream / bidi
 const status = try call.finish(); // final gRPC Status (await trailers)
 ```
 
+> **Ownership:** `call.finish()` returns a `Status` whose `message` (like
+> `call.header()` and `call.trailers()`) points into `call`'s internal arena and
+> is freed by `call.deinit()`. If you need the `Status` to outlive the call
+> (for example, returning it from a helper with `defer call.deinit()`), use
+> `try call.finishInto(arena)` instead.
+
 - **Unary:** `chan.unary(M, arena, req, opts)` does send → half-close → receive
   one → status check in one call. On a non-OK status it returns `error.RpcFailed`
   and, if `opts.status_out` is set, writes the `Status` there.
@@ -140,8 +146,11 @@ pointer for `unary`.
   HTTP/2 connection.
 - **TLS & custom transports:** not built in. `Channel.init` takes any
   `*std.Io.Reader` / `*std.Io.Writer` with a non-empty `opts.authority`, and
-  the caller must close the transport around `Channel.deinit()`. `connectTcp`
-  is the plaintext h2c convenience that owns its socket and derives `:authority`.
+  the caller must close the transport around `Channel.deinit()` (for TCP
+  sockets, enable `TCP_NODELAY` on your socket to avoid Nagle delays on small
+  HTTP/2 frames). `connectTcp` is the plaintext h2c convenience that owns its
+  socket, sets `TCP_NODELAY` by default (`Options.tcp_nodelay`), and derives
+  `:authority`.
 
 ## Go interop
 

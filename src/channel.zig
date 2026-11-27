@@ -2,6 +2,7 @@
 //! Transport-agnostic core (`init` over any reader/writer); `connectTcp`
 //! adds the h2c dial convenience.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const h2 = @import("zig_http2");
 const call_mod = @import("call.zig");
@@ -29,6 +30,12 @@ pub const Channel = struct {
         user_agent: []const u8 = "grpc-zig/0.1",
         max_recv_message_size: u32 = 4 << 20, // grpc-go default
         max_send_message_size: u32 = std.math.maxInt(u32),
+        /// Enables `TCP_NODELAY` on sockets dialed by `connectTcp` so Nagle's
+        /// algorithm does not delay small HTTP/2 frames (HEADERS/DATA/END_STREAM
+        /// and streamed messages) by up to an RTT. Ignored by `init` — callers
+        /// managing their own TCP transport should configure `TCP_NODELAY` on
+        /// their socket directly.
+        tcp_nodelay: bool = true,
     };
 
     /// `self` must stay at a stable address until `deinit` (the h2 client's
@@ -39,6 +46,10 @@ pub const Channel = struct {
     /// and only EOF/error on the transport gets it out — so deinit'ing a channel
     /// over a still-open connection hangs. `connectTcp` owns its socket and
     /// handles this itself; `init` callers must do it.
+    ///
+    /// When `r`/`w` wrap a TCP socket, callers should enable `TCP_NODELAY` on
+    /// the socket (as `connectTcp` does by default) to avoid Nagle stalling
+    /// request DATA and streamed messages behind unacknowledged HEADERS.
     ///
     /// `opts.authority` is required here. HTTP/2 requests carry `:authority`,
     /// gRPC servers route and enforce TLS host checks on it, and
@@ -109,6 +120,7 @@ pub const Channel = struct {
             oc.stream = try hn.connect(io, port, .{ .mode = .stream });
         }
         errdefer oc.stream.close(io);
+        if (opts.tcp_nodelay) setTcpNoDelay(oc.stream.socket.handle);
         oc.sr = oc.stream.reader(io, &oc.rbuf);
         oc.sw = oc.stream.writer(io, &oc.wbuf);
 
@@ -161,11 +173,13 @@ pub const Channel = struct {
         return .{ .raw = try self.startRaw(M.path, call_opts) };
     }
 
-    /// One-shot unary RPC: send → half-close → receive one → status check.
-    /// Non-OK becomes error.RpcFailed. `call_opts.status_out`, when provided,
-    /// always receives the final Status — including for a transport failure
-    /// that never produced one, so a caller can decide on retryability from a
-    /// code instead of an opaque Zig error.
+    /// One-shot unary RPC: encode → open → send → half-close → receive one →
+    /// finish → decode. Non-OK server status becomes `error.RpcFailed` (and
+    /// takes precedence even if a received payload cannot be decoded).
+    /// `call_opts.status_out`, when provided, always receives the final Status:
+    /// transport failures map via `status.codeFromTransportError`, and request
+    /// encode / response decode failures map to `.internal` (or
+    /// `.resource_exhausted` on `OutOfMemory`).
     pub fn unary(
         self: *Channel,
         comptime M: anytype,
@@ -173,7 +187,13 @@ pub const Channel = struct {
         req: @TypeOf(M).Req,
         call_opts: call_mod.CallOptions,
     ) !@TypeOf(M).Res {
-        var c = self.start(M, call_opts) catch |e| {
+        const req_bytes = M.encode_req(self.gpa, req) catch |e| {
+            recordCodecFailure(call_opts, arena, e);
+            return e;
+        };
+        defer self.gpa.free(req_bytes);
+
+        var raw = self.startRaw(M.path, call_opts) catch |e| {
             // No call exists yet, so there is no RawCall.stat to prefer.
             writeStatusBestEffort(call_opts, arena, .{
                 .code = status_mod.codeFromTransportError(e),
@@ -181,56 +201,24 @@ pub const Channel = struct {
             });
             return e;
         };
-        defer c.deinit();
+        defer raw.deinit();
 
-        // If `send` or `closeSend` hits `error.StreamReset`, the peer already
-        // ended the stream (e.g. early Trailers-Only + RST_STREAM(NO_ERROR),
-        // graceful GOAWAY refusal, or RST_STREAM(REFUSED_STREAM)), or a local
-        // cancel() fired. In every case the terminal event is already queued on
-        // `h2.Stream`, so fall through to `recv`/`finish` to surface the real
-        // Status instead of collapsing to `Code.unknown`.
-        var send_reset = false;
-        c.send(req) catch |e| switch (e) {
-            error.StreamReset => send_reset = true,
-            else => {
-                recordFailure(&c.raw, call_opts, arena, e);
-                return e;
-            },
-        };
-        if (!send_reset) {
-            c.closeSend() catch |e| switch (e) {
-                error.StreamReset => {},
-                else => {
-                    recordFailure(&c.raw, call_opts, arena, e);
-                    return e;
-                },
-            };
-        }
-        const res = c.recv(arena) catch |e| {
-            recordFailure(&c.raw, call_opts, arena, e);
+        sendUnaryPayload(&raw, req_bytes) catch |e| {
+            recordFailure(&raw, call_opts, arena, e);
             return e;
         };
-        // A unary response is at most one message. When one arrived, probe once
-        // more at the frame level (skipping decode of an illegal extra message):
-        // on a well-behaved response this consumes trailers and returns null
-        // with no extra round trip; if a second message arrives, bail before
-        // `finish()` so `defer c.deinit()` resets the stream instead of hanging
-        // to drain an unbounded server stream.
-        if (res != null) {
-            const extra = c.raw.recvMessage(arena) catch |e| {
-                recordFailure(&c.raw, call_opts, arena, e);
-                return e;
-            };
-            if (extra != null) {
-                writeStatusBestEffort(call_opts, arena, .{
+        const raw_msg = recvUnaryPayload(&raw, arena) catch |e| {
+            switch (e) {
+                error.TooManyResponses => writeStatusBestEffort(call_opts, arena, .{
                     .code = .internal,
                     .message = "unary response carried more than one message",
-                });
-                return error.TooManyResponses;
+                }),
+                else => recordFailure(&raw, call_opts, arena, e),
             }
-        }
-        const st = c.finish() catch |e| {
-            recordFailure(&c.raw, call_opts, arena, e);
+            return e;
+        };
+        const st = raw.finish() catch |e| {
+            recordFailure(&raw, call_opts, arena, e);
             return e;
         };
 
@@ -238,18 +226,74 @@ pub const Channel = struct {
             writeStatusBestEffort(call_opts, arena, st);
             return error.RpcFailed;
         }
-        if (res == null) {
+        const msg_bytes = raw_msg orelse {
             // OK trailers but no message: the server broke the unary contract.
             writeStatusBestEffort(call_opts, arena, .{
                 .code = .internal,
                 .message = "server ended the call without a response message",
             });
             return error.MissingResponse;
-        }
+        };
+        const res = M.decode_res(arena, msg_bytes) catch |e| {
+            recordCodecFailure(call_opts, arena, e);
+            return e;
+        };
         try writeStatus(call_opts, arena, st);
-        return res.?;
+        return res;
     }
 };
+
+/// Sends one unary request payload and half-closes the stream.
+/// If `sendMessage` or `closeSend` hits `error.StreamReset`, the peer already
+/// ended the stream (e.g. early Trailers-Only + RST_STREAM(NO_ERROR), graceful
+/// GOAWAY refusal, or RST_STREAM), or a local `cancel()` fired. Swallowing it
+/// lets `unary()` fall through to `recv`/`finish` and surface the real Status
+/// instead of collapsing to `Code.unknown`.
+fn sendUnaryPayload(raw: *call_mod.RawCall, req_bytes: []const u8) !void {
+    raw.sendMessage(req_bytes) catch |e| switch (e) {
+        error.StreamReset => return,
+        else => return e,
+    };
+    raw.closeSend() catch |e| switch (e) {
+        error.StreamReset => return,
+        else => return e,
+    };
+}
+
+/// Receives at most one unary response message at the frame level.
+/// When one arrives, probes once more before returning (skipping decode of any
+/// illegal extra message): on a well-behaved response this consumes trailers
+/// and returns null with no extra round trip; if a second message arrives, it
+/// bails with `error.TooManyResponses` so `defer raw.deinit()` resets the
+/// stream instead of hanging in `finish()` to drain an unbounded server stream.
+fn recvUnaryPayload(raw: *call_mod.RawCall, arena: std.mem.Allocator) !?[]u8 {
+    const first = (try raw.recvMessage(arena)) orelse return null;
+    if ((try raw.recvMessage(arena)) != null) return error.TooManyResponses;
+    return first;
+}
+
+/// Best-effort `TCP_NODELAY` on POSIX targets so Nagle does not stall small
+/// HTTP/2 frames behind unacknowledged HEADERS.
+fn setTcpNoDelay(handle: Io.net.Socket.Handle) void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {
+            if (!@hasDecl(std.posix.system, "setsockopt") or
+                !@hasDecl(std.posix.system, "IPPROTO") or
+                !@hasDecl(std.posix.system, "TCP"))
+            {
+                return;
+            }
+            const on: c_int = 1;
+            std.posix.setsockopt(
+                handle,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.NODELAY,
+                std.mem.asBytes(&on),
+            ) catch {};
+        },
+    }
+}
 
 /// Formats `host:port` for `:authority`, enclosing IPv6 literals in `[...]` per
 /// RFC 3986 §3.2.2 / RFC 9113 §8.3.1.
@@ -278,12 +322,22 @@ fn writeStatusBestEffort(call_opts: call_mod.CallOptions, arena: std.mem.Allocat
     out.* = .{ .code = st.code, .message = arena.dupe(u8, st.message) catch "" };
 }
 
-/// Records a mid-call failure. The RawCall's own mapping wins when it has one
-/// (it saw the RST code / HTTP status / trailers); the raw error is only a
-/// fallback for failures that never reached a status.
+/// Records a mid-call transport failure. The RawCall's own mapping wins when
+/// it has one (it saw the RST code / HTTP status / trailers); the raw error is
+/// only a fallback for failures that never reached a status.
 fn recordFailure(raw: *const call_mod.RawCall, call_opts: call_mod.CallOptions, arena: std.mem.Allocator, err: anyerror) void {
     writeStatusBestEffort(call_opts, arena, raw.stat orelse .{
         .code = status_mod.codeFromTransportError(err),
+        .message = @errorName(err),
+    });
+}
+
+/// Records a local codec failure (request encode or response decode). Unlike
+/// transport errors, codec errors are never retryable on a fresh connection, so
+/// they map to `.internal` (or `.resource_exhausted` on `OutOfMemory`).
+fn recordCodecFailure(call_opts: call_mod.CallOptions, arena: std.mem.Allocator, err: anyerror) void {
+    writeStatusBestEffort(call_opts, arena, .{
+        .code = if (err == error.OutOfMemory) .resource_exhausted else .internal,
         .message = @errorName(err),
     });
 }
@@ -816,4 +870,333 @@ test "unary preserves status_out.code and RpcFailed when arena OOMs on non-OK st
     try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
     try testing.expectEqual(status_mod.Code.not_found, runner.st.code);
     try testing.expectEqualStrings("", runner.st.message);
+}
+
+test "startRaw and unary reject HTTP/2 connection-specific metadata (#15)" {
+    var cap: Captured = .{};
+    var lb: testutil.Loopback = undefined;
+    try lb.start(testing.io, testing.allocator, captureHandler, &cap, .{});
+    defer lb.stop();
+
+    const banned = [_][]const u8{
+        "connection",
+        "Connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "Transfer-Encoding",
+        "upgrade",
+        "UPGRADE",
+    };
+    for (banned) |name| {
+        try testing.expectError(error.ReservedMetadataName, lb.chan.startRaw("/test.Svc/Meta", .{
+            .metadata = &.{.{ .name = name, .value = "v" }},
+        }));
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var st: status_mod.Status = undefined;
+    try testing.expectError(error.ReservedMetadataName, lb.chan.unary(
+        UnaryM,
+        arena_state.allocator(),
+        .{ .text = "x" },
+        .{
+            .metadata = &.{.{ .name = "connection", .value = "close" }},
+            .status_out = &st,
+        },
+    ));
+    try testing.expectEqual(status_mod.Code.invalid_argument, st.code);
+}
+
+const ToggleFailWriter = struct {
+    inner: *Io.Writer,
+    fail: std.atomic.Value(bool) = .init(false),
+    interface: Io.Writer = .{
+        .vtable = &.{ .drain = drain, .flush = flush },
+        .buffer = &.{},
+    },
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *ToggleFailWriter = @fieldParentPtr("interface", w);
+        if (self.fail.load(.acquire)) return error.WriteFailed;
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |chunk| {
+            try self.inner.writeAll(chunk);
+            total += chunk.len;
+        }
+        const last = data[data.len - 1];
+        var i: usize = 0;
+        while (i < splat) : (i += 1) {
+            try self.inner.writeAll(last);
+            total += last.len;
+        }
+        return total;
+    }
+
+    fn flush(w: *Io.Writer) Io.Writer.Error!void {
+        const self: *ToggleFailWriter = @fieldParentPtr("interface", w);
+        if (self.fail.load(.acquire)) return error.WriteFailed;
+        try self.inner.flush();
+    }
+};
+
+fn readRawFrame(r: *Io.Reader, gpa: std.mem.Allocator) !testutil.RawPeer.Frame {
+    var hb: [9]u8 = undefined;
+    try r.readSliceAll(&hb);
+    const hdr = h2.proto.parseHeader(&hb);
+    const payload = try gpa.alloc(u8, hdr.length);
+    errdefer gpa.free(payload);
+    if (payload.len > 0) try r.readSliceAll(payload);
+    return .{ .hdr = hdr, .payload = payload };
+}
+
+fn writeRawFrame(w: *Io.Writer, ftype: h2.proto.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
+    var hb: [9]u8 = undefined;
+    h2.proto.putHeader(&hb, payload.len, ftype, flags, sid);
+    try w.writeAll(&hb);
+    if (payload.len > 0) try w.writeAll(payload);
+    try w.flush();
+}
+
+test "unary maps send-path WriteFailed to unavailable (#14)" {
+    const pair = try testutil.makeSocketPairStreams();
+    var cstream = pair.client;
+    var accepted = pair.server;
+    defer {
+        cstream.close(testing.io);
+        accepted.close(testing.io);
+    }
+
+    var crbuf: [8192]u8 = undefined;
+    var cwbuf: [8192]u8 = undefined;
+    var arbuf: [8192]u8 = undefined;
+    var awbuf: [8192]u8 = undefined;
+    var csr = cstream.reader(testing.io, &crbuf);
+    var csw = cstream.writer(testing.io, &cwbuf);
+    var asr = accepted.reader(testing.io, &arbuf);
+    var asw = accepted.writer(testing.io, &awbuf);
+
+    var tw: ToggleFailWriter = .{ .inner = &csw.interface };
+    var chan: Channel = undefined;
+    try chan.init(testing.io, testing.allocator, &csr.interface, &tw.interface, .{ .authority = "raw" });
+    defer {
+        cstream.shutdown(testing.io, .both) catch {};
+        accepted.shutdown(testing.io, .both) catch {};
+        chan.deinit();
+    }
+
+    // Complete h2 handshake and force the initial stream send window to 0 so
+    // openStream succeeds and Stream.send blocks until we release it.
+    var pf: [h2.proto.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    const cset = try readRawFrame(&asr.interface, testing.allocator);
+    testing.allocator.free(cset.payload);
+
+    var iw0: [6]u8 = undefined;
+    h2.proto.putSetting(&iw0, h2.proto.set_initial_window_size, 0);
+    try writeRawFrame(&asw.interface, .settings, 0, 0, &iw0);
+    try writeRawFrame(&asw.interface, .settings, h2.proto.flag_ack, 0, "");
+    while (true) {
+        const f = try readRawFrame(&asr.interface, testing.allocator);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & h2.proto.flag_ack != 0);
+        testing.allocator.free(f.payload);
+        if (is_ack) break;
+    }
+
+    var runner: UnaryRunner = .{ .chan = &chan };
+    const th = try std.Thread.spawn(.{}, UnaryRunner.run, .{&runner});
+
+    // Wait until openStream has emitted HEADERS; sendMessage is now blocked on
+    // flow control. Arm write failure and grant stream window so writeDataForStream
+    // fails deterministically with error.WriteFailed.
+    const sid = while (true) {
+        const f = try readRawFrame(&asr.interface, testing.allocator);
+        testing.allocator.free(f.payload);
+        if (f.hdr.ftype == .headers) break f.hdr.sid;
+    };
+    tw.fail.store(true, .release);
+    var wu: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu, 1024, .big);
+    try writeRawFrame(&asw.interface, .window_update, 0, sid, &wu);
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, error.WriteFailed), runner.err);
+    try testing.expectEqual(status_mod.Code.unavailable, runner.code);
+    try testing.expectEqualStrings("WriteFailed", runner.msg_buf[0..runner.msg_len]);
+}
+
+const BadDecodeMsg = struct {
+    text: []const u8 = "",
+
+    pub fn encode(self: BadDecodeMsg, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, self.text);
+    }
+
+    pub fn decode(_: std.mem.Allocator, _: []const u8) !BadDecodeMsg {
+        return error.BadMessage;
+    }
+};
+
+const OomDecodeMsg = struct {
+    pub fn encode(_: OomDecodeMsg, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, "x");
+    }
+
+    pub fn decode(_: std.mem.Allocator, _: []const u8) !OomDecodeMsg {
+        return error.OutOfMemory;
+    }
+};
+
+const BadEncodeMsg = struct {
+    pub fn encode(_: BadEncodeMsg, _: std.mem.Allocator) ![]u8 {
+        // Deliberately use WriteFailed (which Writer.Allocating can emit on OOM)
+        // to verify encode errors map to internal rather than transport unavailable.
+        return error.WriteFailed;
+    }
+
+    pub fn decode(_: std.mem.Allocator, _: []const u8) !BadEncodeMsg {
+        return .{};
+    }
+};
+
+test "unary maps decode/encode failures to internal and prefers non-OK server status (#14)" {
+    const BadDecodeM = codec_mod.Method(BadDecodeMsg, BadDecodeMsg){ .path = "/test.Svc/BadDecode" };
+    const OomDecodeM = codec_mod.Method(OomDecodeMsg, OomDecodeMsg){ .path = "/test.Svc/OomDecode" };
+    const BadEncodeM = codec_mod.Method(BadEncodeMsg, BadEncodeMsg){ .path = "/test.Svc/BadEncode" };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 1) OK response + decode failure -> error.BadMessage with status_out.code == .internal.
+    {
+        var lb: testutil.Loopback = undefined;
+        try lb.start(testing.io, testing.allocator, unaryOkHandler, null, .{});
+        defer lb.stop();
+
+        var st: status_mod.Status = undefined;
+        try testing.expectError(error.BadMessage, lb.chan.unary(
+            BadDecodeM,
+            arena,
+            .{ .text = "payload" },
+            .{ .status_out = &st },
+        ));
+        try testing.expectEqual(status_mod.Code.internal, st.code);
+        try testing.expectEqualStrings("BadMessage", st.message);
+
+        // OOM during decode maps to resource_exhausted.
+        var oom_st: status_mod.Status = undefined;
+        try testing.expectError(error.OutOfMemory, lb.chan.unary(
+            OomDecodeM,
+            arena,
+            .{},
+            .{ .status_out = &oom_st },
+        ));
+        try testing.expectEqual(status_mod.Code.resource_exhausted, oom_st.code);
+
+        // Request encode failure maps to internal (never unavailable, even for WriteFailed).
+        var enc_st: status_mod.Status = undefined;
+        try testing.expectError(error.WriteFailed, lb.chan.unary(
+            BadEncodeM,
+            arena,
+            .{},
+            .{ .status_out = &enc_st },
+        ));
+        try testing.expectEqual(status_mod.Code.internal, enc_st.code);
+        try testing.expectEqualStrings("WriteFailed", enc_st.message);
+    }
+
+    // 2) Non-OK server status wins over an undecodable payload.
+    {
+        var rp: testutil.RawPeer = undefined;
+        try rp.start(testing.io, testing.allocator);
+        defer rp.stop();
+
+        const BadDecodeRunner = struct {
+            chan: *Channel,
+            err: ?anyerror = null,
+            code: status_mod.Code = .ok,
+            msg_buf: [64]u8 = undefined,
+            msg_len: usize = 0,
+
+            fn run(self: *@This()) void {
+                var a = std.heap.ArenaAllocator.init(testing.allocator);
+                defer a.deinit();
+                var st: status_mod.Status = .{ .code = .ok };
+                if (self.chan.unary(BadDecodeM, a.allocator(), .{ .text = "x" }, .{ .status_out = &st })) |_| {} else |e| {
+                    self.err = e;
+                }
+                self.code = st.code;
+                const n = @min(st.message.len, self.msg_buf.len);
+                @memcpy(self.msg_buf[0..n], st.message[0..n]);
+                self.msg_len = n;
+            }
+        };
+
+        var runner: BadDecodeRunner = .{ .chan = &rp.chan };
+        const th = try std.Thread.spawn(.{}, BadDecodeRunner.run, .{&runner});
+        const hf = try rp.readUntil(.headers);
+        testing.allocator.free(hf.payload);
+        const sid = hf.hdr.sid;
+
+        var blk: testutil.RawPeer.HpackBlock = .{};
+        defer blk.deinit(testing.allocator);
+        try blk.status200(testing.allocator);
+        try blk.literal(testing.allocator, "content-type", "application/grpc");
+        try rp.writeFrame(.headers, h2.proto.flag_end_headers, sid, blk.buf.items);
+
+        const body = [_]u8{ 0, 0, 0, 0, 3 } ++ "bad".*;
+        try rp.writeFrame(.data, 0, sid, &body);
+
+        var tblk: testutil.RawPeer.HpackBlock = .{};
+        defer tblk.deinit(testing.allocator);
+        try tblk.literal(testing.allocator, "grpc-status", "5");
+        try tblk.literal(testing.allocator, "grpc-message", "server%20err");
+        try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, sid, tblk.buf.items);
+        th.join();
+
+        try testing.expectEqual(@as(?anyerror, error.RpcFailed), runner.err);
+        try testing.expectEqual(status_mod.Code.not_found, runner.code);
+        try testing.expectEqualStrings("server err", runner.msg_buf[0..runner.msg_len]);
+    }
+}
+
+test "connectTcp enables TCP_NODELAY by default and respects tcp_nodelay=false (#17)" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (!canBindTcp4()) return error.SkipZigTest;
+
+    const io = testing.io;
+    for ([_]bool{ true, false }) |want_nodelay| {
+        const addr0 = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try addr0.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer listener.deinit(io);
+        const port = listener.socket.address.ip4.port;
+
+        var srv: h2.Server = .{ .io = io, .gpa = testing.allocator, .handler = tcpOkHandler };
+        var tsrv: TcpSrv = .{ .io = io, .listener = &listener, .srv = &srv };
+        const th = try std.Thread.spawn(.{}, TcpSrv.run, .{&tsrv});
+
+        var chan: Channel = undefined;
+        try chan.connectTcp(io, testing.allocator, "127.0.0.1", port, .{ .tcp_nodelay = want_nodelay });
+
+        var val: c_int = -1;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        const rc = std.c.getsockopt(
+            chan.owned.?.stream.socket.handle,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            &val,
+            &len,
+        );
+        chan.deinit();
+        th.join();
+
+        try testing.expectEqual(@as(c_int, 0), rc);
+        if (want_nodelay) {
+            try testing.expect(val != 0);
+        } else {
+            try testing.expectEqual(@as(c_int, 0), val);
+        }
+    }
 }
