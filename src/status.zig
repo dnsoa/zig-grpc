@@ -78,7 +78,10 @@ pub fn codeFromH2Error(code: u32) Code {
 /// whether retrying is safe, and that answer is a code, not an error name:
 /// `GoingAway`/`ConnectionClosed`/`StreamIdsExhausted`/`WriteFailed` all mean
 /// "this connection is done, a fresh one will work" (`unavailable`), while
-/// `HeadersTooLarge` means the request itself will never fit.
+/// `HeadersTooLarge` means the request itself will never fit. Note that
+/// `WriteFailed => .unavailable` is strictly for transport-path write failures
+/// after `zig-http2` has already marked the connection dead (not arbitrary
+/// local `std.Io.Writer` failures).
 ///
 /// Only for errors with no status of their own — a `RawCall` that already
 /// mapped one (via `codeFromH2Error`, `codeFromHttpStatus`, or the trailers)

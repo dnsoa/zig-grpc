@@ -88,7 +88,14 @@ fn defaultEncode(comptime T: type) *const fn (std.mem.Allocator, T) anyerror![]u
                 // zig-protobuf Io API: encode(self, *std.Io.Writer, allocator)
                 var aw: std.Io.Writer.Allocating = .init(gpa);
                 errdefer aw.deinit();
-                try msg.encode(&aw.writer, gpa);
+                msg.encode(&aw.writer, gpa) catch |err| {
+                    // Io.Writer.Allocating translates allocation failure into
+                    // WriteFailed; surface OutOfMemory so callers (including
+                    // streaming Call.send) never mistake a local encode OOM for
+                    // a dead-connection transport WriteFailed.
+                    if (@as(anyerror, err) == error.WriteFailed) return error.OutOfMemory;
+                    return err;
+                };
                 return aw.toOwnedSlice();
             } else {
                 // legacy: encode(self, allocator) []u8
@@ -202,4 +209,22 @@ test "default codec supports zig-protobuf Io Writer/Reader signatures" {
     defer arena_state.deinit();
     const msg = try M.decode_res(arena_state.allocator(), "io-pong");
     try testing.expectEqualStrings("io-pong", msg.text);
+}
+
+test "default codec translates Writer.Allocating OOM WriteFailed to OutOfMemory" {
+    const M = Method(ProtoIoMsg, ProtoIoMsg){ .path = "/proto.Svc/Oom" };
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, M.encode_req(fail.allocator(), .{ .text = "payload" }));
+
+    // Non-WriteFailed errors from Io-style encode still pass through untouched.
+    const CustomErrMsg = struct {
+        pub fn encode(_: @This(), _: *std.Io.Writer, _: std.mem.Allocator) error{InvalidField}!void {
+            return error.InvalidField;
+        }
+        pub fn decode(_: *std.Io.Reader, _: std.mem.Allocator) !@This() {
+            return .{};
+        }
+    };
+    const CM = Method(CustomErrMsg, CustomErrMsg){ .path = "/proto.Svc/CustomErr" };
+    try testing.expectError(error.InvalidField, CM.encode_req(testing.allocator, .{}));
 }

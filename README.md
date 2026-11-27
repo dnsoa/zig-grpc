@@ -149,8 +149,10 @@ pointer for `unary`.
   the caller must close the transport around `Channel.deinit()` (for TCP
   sockets, enable `TCP_NODELAY` on your socket to avoid Nagle delays on small
   HTTP/2 frames). `connectTcp` is the plaintext h2c convenience that owns its
-  socket, sets `TCP_NODELAY` by default (`Options.tcp_nodelay`), and derives
-  `:authority`.
+  socket, derives `:authority`, and enables `TCP_NODELAY` best-effort by default
+  (`Options.tcp_nodelay`) on POSIX targets where `std.posix.system` exposes
+  `setsockopt` / `IPPROTO` / `TCP` (currently a silent no-op on Windows and WASI,
+  where Nagle remains enabled).
 
 ## Go interop
 

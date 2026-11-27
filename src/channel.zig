@@ -30,11 +30,16 @@ pub const Channel = struct {
         user_agent: []const u8 = "grpc-zig/0.1",
         max_recv_message_size: u32 = 4 << 20, // grpc-go default
         max_send_message_size: u32 = std.math.maxInt(u32),
-        /// Enables `TCP_NODELAY` on sockets dialed by `connectTcp` so Nagle's
-        /// algorithm does not delay small HTTP/2 frames (HEADERS/DATA/END_STREAM
-        /// and streamed messages) by up to an RTT. Ignored by `init` — callers
-        /// managing their own TCP transport should configure `TCP_NODELAY` on
-        /// their socket directly.
+        /// Best-effort `TCP_NODELAY` on sockets dialed by `connectTcp` so
+        /// Nagle's algorithm does not delay small HTTP/2 frames
+        /// (HEADERS/DATA/END_STREAM and streamed messages) by up to an RTT.
+        ///
+        /// Currently takes effect only on POSIX targets where `std.posix.system`
+        /// exposes `setsockopt`, `IPPROTO`, and `TCP` (errors from `setsockopt`
+        /// are ignored). On Windows, WASI, or targets lacking those
+        /// declarations this option is a silent no-op and Nagle remains enabled.
+        /// Ignored by `init` — callers managing their own TCP transport should
+        /// configure `TCP_NODELAY` on their socket directly.
         tcp_nodelay: bool = true,
     };
 
@@ -140,6 +145,11 @@ pub const Channel = struct {
     /// Opens a bytes-level call: sends request HEADERS, returns the RawCall.
     /// The returned value owns per-call state; call `deinit` when done.
     pub fn startRaw(self: *Channel, path: []const u8, call_opts: call_mod.CallOptions) !call_mod.RawCall {
+        try validateMetadata(call_opts.metadata);
+        return self.startRawValidated(path, call_opts);
+    }
+
+    fn startRawValidated(self: *Channel, path: []const u8, call_opts: call_mod.CallOptions) !call_mod.RawCall {
         // RequestHead.headers is []const hpack.Header (not the types.Header
         // re-exported as h2.Header); they are structurally identical but
         // distinct named types, so build the one openStream consumes.
@@ -153,9 +163,6 @@ pub const Channel = struct {
             try headers.append(self.gpa, .{ .name = "grpc-timeout", .value = metadata_mod.encodeTimeout(ns, &tbuf) });
         }
         for (call_opts.metadata) |e| {
-            if (metadata_mod.isReservedName(e.name)) return error.ReservedMetadataName;
-            if (!metadata_mod.isValidName(e.name)) return error.InvalidMetadataName;
-            if (!metadata_mod.isValidValue(e.value)) return error.InvalidMetadataValue;
             try headers.append(self.gpa, .{ .name = e.name, .value = e.value });
         }
         const s = try self.h2c.openStream(.{
@@ -173,13 +180,13 @@ pub const Channel = struct {
         return .{ .raw = try self.startRaw(M.path, call_opts) };
     }
 
-    /// One-shot unary RPC: encode → open → send → half-close → receive one →
-    /// finish → decode. Non-OK server status becomes `error.RpcFailed` (and
-    /// takes precedence even if a received payload cannot be decoded).
-    /// `call_opts.status_out`, when provided, always receives the final Status:
-    /// transport failures map via `status.codeFromTransportError`, and request
-    /// encode / response decode failures map to `.internal` (or
-    /// `.resource_exhausted` on `OutOfMemory`).
+    /// One-shot unary RPC: validate metadata → encode → open → send →
+    /// half-close → receive one → finish → decode. Non-OK server status becomes
+    /// `error.RpcFailed` (and takes precedence even if a received payload cannot
+    /// be decoded). `call_opts.status_out`, when provided, always receives the
+    /// final Status: transport/validation failures map via
+    /// `status.codeFromTransportError`, and request encode / response decode
+    /// failures map to `.internal` (or `.resource_exhausted` on `OutOfMemory`).
     pub fn unary(
         self: *Channel,
         comptime M: anytype,
@@ -187,13 +194,21 @@ pub const Channel = struct {
         req: @TypeOf(M).Req,
         call_opts: call_mod.CallOptions,
     ) !@TypeOf(M).Res {
+        validateMetadata(call_opts.metadata) catch |e| {
+            writeStatusBestEffort(call_opts, arena, .{
+                .code = status_mod.codeFromTransportError(e),
+                .message = @errorName(e),
+            });
+            return e;
+        };
+
         const req_bytes = M.encode_req(self.gpa, req) catch |e| {
             recordCodecFailure(call_opts, arena, e);
             return e;
         };
         defer self.gpa.free(req_bytes);
 
-        var raw = self.startRaw(M.path, call_opts) catch |e| {
+        var raw = self.startRawValidated(M.path, call_opts) catch |e| {
             // No call exists yet, so there is no RawCall.stat to prefer.
             writeStatusBestEffort(call_opts, arena, .{
                 .code = status_mod.codeFromTransportError(e),
@@ -243,6 +258,15 @@ pub const Channel = struct {
     }
 };
 
+/// Rejects reserved, malformed, or unsafe user metadata at the call boundary.
+fn validateMetadata(entries: []const call_mod.Metadata.Entry) !void {
+    for (entries) |e| {
+        if (metadata_mod.isReservedName(e.name)) return error.ReservedMetadataName;
+        if (!metadata_mod.isValidName(e.name)) return error.InvalidMetadataName;
+        if (!metadata_mod.isValidValue(e.value)) return error.InvalidMetadataValue;
+    }
+}
+
 /// Sends one unary request payload and half-closes the stream.
 /// If `sendMessage` or `closeSend` hits `error.StreamReset`, the peer already
 /// ended the stream (e.g. early Trailers-Only + RST_STREAM(NO_ERROR), graceful
@@ -272,8 +296,9 @@ fn recvUnaryPayload(raw: *call_mod.RawCall, arena: std.mem.Allocator) !?[]u8 {
     return first;
 }
 
-/// Best-effort `TCP_NODELAY` on POSIX targets so Nagle does not stall small
-/// HTTP/2 frames behind unacknowledged HEADERS.
+/// Best-effort `TCP_NODELAY` on POSIX targets exposing
+/// `std.posix.system.{setsockopt,IPPROTO,TCP}`. Silent no-op on Windows, WASI,
+/// or targets lacking those declarations (Nagle remains enabled).
 fn setTcpNoDelay(handle: Io.net.Socket.Handle) void {
     switch (builtin.os.tag) {
         .windows, .wasi => return,
@@ -1105,6 +1130,20 @@ test "unary maps decode/encode failures to internal and prefers non-OK server st
         ));
         try testing.expectEqual(status_mod.Code.internal, enc_st.code);
         try testing.expectEqualStrings("WriteFailed", enc_st.message);
+
+        // Metadata validation runs before request encoding so invalid metadata
+        // neither allocates an encoded buffer nor gets masked by an encode error.
+        var md_st: status_mod.Status = undefined;
+        try testing.expectError(error.ReservedMetadataName, lb.chan.unary(
+            BadEncodeM,
+            arena,
+            .{},
+            .{
+                .metadata = &.{.{ .name = "connection", .value = "close" }},
+                .status_out = &md_st,
+            },
+        ));
+        try testing.expectEqual(status_mod.Code.invalid_argument, md_st.code);
     }
 
     // 2) Non-OK server status wins over an undecodable payload.
