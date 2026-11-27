@@ -7,7 +7,7 @@ const h2 = @import("zig_http2");
 const channel_mod = @import("channel.zig");
 const Io = std.Io;
 
-fn makeSocketPairStreams() !struct { client: Io.net.Stream, server: Io.net.Stream } {
+pub fn makeSocketPairStreams() !struct { client: Io.net.Stream, server: Io.net.Stream } {
     var fds: [2]c_int = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
         return error.SocketPairFailed;

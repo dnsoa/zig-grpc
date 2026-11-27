@@ -76,9 +76,12 @@ pub fn codeFromH2Error(code: u32) Code {
 ///
 /// The point is retryability. A caller's first question about a failed RPC is
 /// whether retrying is safe, and that answer is a code, not an error name:
-/// `GoingAway`/`ConnectionClosed`/`StreamIdsExhausted` all mean "this
-/// connection is done, a fresh one will work" (`unavailable`), while
-/// `HeadersTooLarge` means the request itself will never fit.
+/// `GoingAway`/`ConnectionClosed`/`StreamIdsExhausted`/`WriteFailed` all mean
+/// "this connection is done, a fresh one will work" (`unavailable`), while
+/// `HeadersTooLarge` means the request itself will never fit. Note that
+/// `WriteFailed => .unavailable` is strictly for transport-path write failures
+/// after `zig-http2` has already marked the connection dead (not arbitrary
+/// local `std.Io.Writer` failures).
 ///
 /// Only for errors with no status of their own — a `RawCall` that already
 /// mapped one (via `codeFromH2Error`, `codeFromHttpStatus`, or the trailers)
@@ -86,7 +89,13 @@ pub fn codeFromH2Error(code: u32) Code {
 pub fn codeFromTransportError(err: anyerror) Code {
     return switch (err) {
         // The connection is going away or gone; a new one is safe to retry on.
-        error.ConnectionClosed, error.GoingAway, error.StreamIdsExhausted => .unavailable,
+        // Zig 0.17 converges EPIPE/ECONNRESET on the write path to WriteFailed,
+        // and zig-http2 marks the connection dead immediately on write failure.
+        error.ConnectionClosed,
+        error.GoingAway,
+        error.StreamIdsExhausted,
+        error.WriteFailed,
+        => .unavailable,
         // Deliberately NOT `unavailable`. zig-http2's send path returns
         // StreamReset for two different things: a peer RST (whose error code
         // never reaches us here) and a local `cancel()` — `abortLocal` sets the
@@ -190,11 +199,12 @@ test "percentDecode handles valid, invalid, and plain strings" {
 }
 
 test "codeFromTransportError separates retryable from terminal" {
-    // The whole point: these three mean "this connection is done, a fresh one
+    // The whole point: these four mean "this connection is done, a fresh one
     // will work", which a caller can only act on as a code.
     try testing.expectEqual(Code.unavailable, codeFromTransportError(error.ConnectionClosed));
     try testing.expectEqual(Code.unavailable, codeFromTransportError(error.GoingAway));
     try testing.expectEqual(Code.unavailable, codeFromTransportError(error.StreamIdsExhausted));
+    try testing.expectEqual(Code.unavailable, codeFromTransportError(error.WriteFailed));
     // These will not get better on retry.
     try testing.expectEqual(Code.resource_exhausted, codeFromTransportError(error.HeadersTooLarge));
     try testing.expectEqual(Code.resource_exhausted, codeFromTransportError(error.MessageTooLarge));

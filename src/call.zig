@@ -22,9 +22,10 @@ pub const CallOptions = struct {
     /// another thread.
     timeout_ns: ?u64 = null,
     /// For `Channel.unary` only: receives the call's final Status — on success,
-    /// on a non-OK status, and on a transport failure that never produced one
-    /// (mapped via `status.codeFromTransportError`). The message is duped into
-    /// the arena passed to `unary`.
+    /// on a non-OK status, on a transport failure that never produced one
+    /// (mapped via `status.codeFromTransportError`), and on local codec
+    /// encode/decode failures (mapped to `.internal`, or `.resource_exhausted`
+    /// on `OutOfMemory`). The message is duped into the arena passed to `unary`.
     status_out: ?*Status = null,
 };
 
@@ -184,8 +185,7 @@ pub const RawCall = struct {
             // enough to get the head phase decided.
             if (self.recv_mu.tryLock()) {
                 defer self.releaseRecvMu();
-                while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
-                return self.resp_headers orelse .{};
+                return self.driveHeadersLocked();
             }
 
             // Someone else is driving. Wait for the head phase to be *decided*
@@ -197,14 +197,20 @@ pub const RawCall = struct {
                 if (self.recv_mu.tryLock()) {
                     self.head_mu.unlock(self.chan.io);
                     defer self.releaseRecvMu();
-                    while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
-                    return self.resp_headers orelse .{};
+                    return self.driveHeadersLocked();
                 }
                 self.head_cond.waitUncancelable(self.chan.io, &self.head_mu);
             }
             self.head_mu.unlock(self.chan.io);
             // Loop: either it settled, or the driver bailed and we take over.
         }
+    }
+
+    /// `recv_mu` held. Steps until initial response HEADERS arrive or the call
+    /// leaves `.awaiting_headers`.
+    fn driveHeadersLocked(self: *RawCall) !Metadata {
+        while (self.resp_headers == null and self.state == .awaiting_headers) try self.step();
+        return self.resp_headers orelse .{};
     }
 
     /// Wakes threads parked in `header()`. Takes `head_mu` so a wakeup cannot
@@ -218,6 +224,11 @@ pub const RawCall = struct {
     /// Drains any remaining messages, then returns the final status. Intended
     /// after recvMessage returned null (for streams) or directly (unary
     /// convenience). NOTE: blocks until the server ends the stream.
+    ///
+    /// Ownership: the returned `Status.message` points into this call's
+    /// internal arena and is **invalidated by `deinit()`**. If the `Status`
+    /// must outlive the call (e.g. returned from a function that `defer`s
+    /// `call.deinit()`), use `finishInto(arena)` or dupe `status.message`.
     pub fn finish(self: *RawCall) !Status {
         self.recv_mu.lockUncancelable(self.chan.io);
         defer self.releaseRecvMu();
@@ -240,6 +251,16 @@ pub const RawCall = struct {
             _ = scratch.reset(.retain_capacity);
         }
         return self.stat orelse .{ .code = .internal, .message = "call ended without status" };
+    }
+
+    /// Like `finish()`, but dupes any non-empty `Status.message` into `arena`
+    /// so the returned `Status` remains valid after `deinit()`.
+    pub fn finishInto(self: *RawCall, arena: std.mem.Allocator) !Status {
+        const st = try self.finish();
+        return .{
+            .code = st.code,
+            .message = if (st.message.len == 0) "" else try arena.dupe(u8, st.message),
+        };
     }
 
     /// Trailer metadata (excluding grpc-status/grpc-message); valid after
@@ -335,30 +356,18 @@ pub const RawCall = struct {
                     return;
                 }
                 if (parsed != 200) {
-                    self.stat = .{
+                    try self.rejectHeadResponse(arena, hs, end_stream, .{
                         .code = status_mod.codeFromHttpStatus(parsed),
                         .message = try std.fmt.allocPrint(arena, "unexpected HTTP status \"{s}\"", .{http_status}),
-                    };
-                    if (end_stream) {
-                        self.resp_trailers = try dupEntries(arena, hs);
-                        self.state = .done;
-                    } else {
-                        self.abandon();
-                    }
+                    });
                     return;
                 }
                 const ct = findHeader(hs, "content-type") orelse "";
                 if (!isGrpcContentType(ct)) {
-                    self.stat = .{
+                    try self.rejectHeadResponse(arena, hs, end_stream, .{
                         .code = .internal,
                         .message = try std.fmt.allocPrint(arena, "bad content-type \"{s}\"", .{ct}),
-                    };
-                    if (end_stream) {
-                        self.resp_trailers = try dupEntries(arena, hs);
-                        self.state = .done;
-                    } else {
-                        self.abandon();
-                    }
+                    });
                     return;
                 }
                 if (end_stream) {
@@ -396,6 +405,24 @@ pub const RawCall = struct {
                 self.state = .done;
             },
             .done => {},
+        }
+    }
+
+    /// Records an invalid initial HEADERS block: preserves trailers if the
+    /// peer already closed the stream, otherwise cancels and ends the call.
+    fn rejectHeadResponse(
+        self: *RawCall,
+        arena: std.mem.Allocator,
+        hs: []const h2.hpack.Header,
+        end_stream: bool,
+        stat: Status,
+    ) !void {
+        self.stat = stat;
+        if (end_stream) {
+            self.resp_trailers = try dupEntries(arena, hs);
+            self.state = .done;
+        } else {
+            self.abandon();
         }
     }
 
@@ -476,14 +503,27 @@ pub fn Call(comptime M: anytype) type {
             return self.raw.closeSend();
         }
 
+        /// Blocks until the response HEADERS arrive; empty for Trailers-Only.
+        /// Returned Metadata is owned by the call until `deinit()`.
         pub fn header(self: *Self) !Metadata {
             return self.raw.header();
         }
 
+        /// Drains any remaining messages and returns the final Status.
+        /// `Status.message` is owned by the call and invalidated by `deinit()`;
+        /// use `finishInto(arena)` if the Status must outlive the call.
         pub fn finish(self: *Self) !Status {
             return self.raw.finish();
         }
 
+        /// Like `finish()`, but dupes any non-empty `Status.message` into
+        /// `arena` so the returned Status remains valid after `deinit()`.
+        pub fn finishInto(self: *Self, arena: std.mem.Allocator) !Status {
+            return self.raw.finishInto(arena);
+        }
+
+        /// Trailer metadata (excluding grpc-status/grpc-message); valid after
+        /// `finish()`/`recv() == null`, owned by the call until `deinit()`.
         pub fn trailers(self: *const Self) Metadata {
             return self.raw.trailers();
         }
@@ -1457,4 +1497,76 @@ test "finish() maps step() OutOfMemory to resource_exhausted and settles the cal
     // Peer receives RST_STREAM from abandon().
     const rst = try rp.readUntil(.rst_stream);
     testing.allocator.free(rst.payload);
+}
+
+test "finishInto dupes status message into caller arena so it outlives call.deinit() (#16)" {
+    var caller_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer caller_arena_state.deinit();
+    const caller_arena = caller_arena_state.allocator();
+
+    // 1) RawCall.finishInto on Trailers-Only with a percent-encoded message.
+    {
+        var rp: testutil.RawPeer = undefined;
+        try rp.start(testing.io, testing.allocator);
+        defer rp.stop();
+
+        const st = blk: {
+            var call = try rp.chan.startRaw("/test.Svc/FinishInto", .{});
+            defer call.deinit();
+            try call.closeSend();
+
+            const hf = try rp.readUntil(.headers);
+            testing.allocator.free(hf.payload);
+
+            var hdrs: testutil.RawPeer.HpackBlock = .{};
+            defer hdrs.deinit(testing.allocator);
+            try hdrs.status200(testing.allocator);
+            try hdrs.literal(testing.allocator, "content-type", "application/grpc");
+            try hdrs.literal(testing.allocator, "grpc-status", "5");
+            try hdrs.literal(testing.allocator, "grpc-message", "boom%20boom");
+            try rp.writeFrame(.headers, h2.proto.flag_end_headers | h2.proto.flag_end_stream, hf.hdr.sid, hdrs.buf.items);
+
+            break :blk try call.finishInto(caller_arena);
+        };
+        // `call.deinit()` has already freed (and in Debug poisoned) call.arena_state.
+        try testing.expectEqual(status_mod.Code.not_found, st.code);
+        try testing.expectEqualStrings("boom boom", st.message);
+    }
+
+    // 2) Typed Call(M).finishInto on both non-OK and OK (empty message) calls.
+    {
+        var lb: testutil.Loopback = undefined;
+        try lb.start(testing.io, testing.allocator, notFoundHandler, null, .{});
+        defer lb.stop();
+
+        const st = blk: {
+            var call = try lb.chan.start(EchoM, .{});
+            defer call.deinit();
+            try call.send(.{ .text = "x" });
+            try call.closeSend();
+            try testing.expect((try call.recv(caller_arena)) == null);
+            break :blk try call.finishInto(caller_arena);
+        };
+        try testing.expectEqual(status_mod.Code.not_found, st.code);
+        try testing.expectEqualStrings("no such thing", st.message);
+    }
+    {
+        var lb: testutil.Loopback = undefined;
+        try lb.start(testing.io, testing.allocator, unaryEchoHandler, null, .{});
+        defer lb.stop();
+
+        var zero_budget = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const st = blk: {
+            var call = try lb.chan.start(EchoM, .{});
+            defer call.deinit();
+            try call.send(.{ .text = "ok" });
+            try call.closeSend();
+            try testing.expectEqualStrings("ok", (try call.recv(caller_arena)).?.text);
+            try testing.expect((try call.recv(caller_arena)) == null);
+            // Empty OK message does not allocate in the caller arena.
+            break :blk try call.finishInto(zero_budget.allocator());
+        };
+        try testing.expect(st.isOk());
+        try testing.expectEqualStrings("", st.message);
+    }
 }

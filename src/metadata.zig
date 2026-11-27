@@ -46,14 +46,29 @@ pub const Metadata = struct {
     }
 };
 
-/// Header names the client manages itself; user metadata may not use them.
+/// Header names the client manages itself or that HTTP/2 forbids on the wire
+/// (connection-specific headers, RFC 9113 §8.2.2); user metadata may not use
+/// them.
 pub fn isReservedName(name: []const u8) bool {
     if (name.len == 0) return true;
     if (name[0] == ':') return true;
     if (std.ascii.startsWithIgnoreCase(name, "grpc-")) return true;
-    return std.ascii.eqlIgnoreCase(name, "content-type") or
-        std.ascii.eqlIgnoreCase(name, "te") or
-        std.ascii.eqlIgnoreCase(name, "user-agent");
+    const reserved = [_][]const u8{
+        // gRPC/HTTP/2 transport headers managed by the client
+        "content-type",
+        "te",
+        "user-agent",
+        // HTTP/2 forbidden connection-specific headers (RFC 9113 §8.2.2)
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    };
+    for (reserved) |r| {
+        if (std.ascii.eqlIgnoreCase(name, r)) return true;
+    }
+    return false;
 }
 
 /// Whether a metadata key is legal to put on the wire. The gRPC spec allows
@@ -159,12 +174,21 @@ test "getBin decodes padded and unpadded base64" {
     try testing.expect((try padded.getBin(arena, "other-bin")) == null);
 }
 
-test "isReservedName blocks pseudo, grpc-*, and transport headers" {
+test "isReservedName blocks pseudo, grpc-*, transport, and connection-specific headers" {
     try testing.expect(isReservedName(":path"));
     try testing.expect(isReservedName("grpc-timeout"));
     try testing.expect(isReservedName("content-type"));
     try testing.expect(isReservedName("te"));
     try testing.expect(isReservedName("user-agent"));
+    // RFC 9113 §8.2.2 connection-specific headers (case-insensitive)
+    try testing.expect(isReservedName("connection"));
+    try testing.expect(isReservedName("Connection"));
+    try testing.expect(isReservedName("keep-alive"));
+    try testing.expect(isReservedName("proxy-connection"));
+    try testing.expect(isReservedName("transfer-encoding"));
+    try testing.expect(isReservedName("Transfer-Encoding"));
+    try testing.expect(isReservedName("upgrade"));
+    try testing.expect(isReservedName("UPGRADE"));
     try testing.expect(isReservedName(""));
     try testing.expect(!isReservedName("x-custom"));
     try testing.expect(!isReservedName("authorization"));
